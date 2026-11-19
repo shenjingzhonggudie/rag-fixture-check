@@ -1,0 +1,67 @@
+# Copy this file to .github/workflows/rag-fixture-check.yml in your docs repo.
+#
+# It runs on pull_request only, needs no secrets, and requests read-only access.
+# The tool verifies that every evidence anchor in .rag-fixtures.json still
+# resolves in the head commit; it does not judge answer quality.
+#
+# Requirements:
+#   - .rag-fixtures.json exists at the repository root (or pass --fixture)
+#   - fetch-depth: 0, because the base commit must be present locally
+name: rag-fixture-check
+
+on:
+  pull_request:
+    # Optional: only run when evidence can actually be invalidated.
+    # paths:
+    #   - ".rag-fixtures.json"
+    #   - "docs/**"
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Pin the exact commit under review; branch names can move.
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Install rag-fixture-check
+        run: go install github.com/shenjingzhonggudie/rag-fixture-check@v0.1.0
+
+      # Annotations land on the changed files. Exit code 1 fails the job.
+      - name: Verify evidence anchors
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          "$(go env GOPATH)/bin/rag-fixture-check" check
+          --repo . --base "$BASE_SHA" --head "$HEAD_SHA" --format github
+
+      # Keep the full report even when annotations are truncated in the log.
+      - name: Save a readable report on failure
+        if: failure()
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          "$(go env GOPATH)/bin/rag-fixture-check" check
+          --repo . --base "$BASE_SHA" --head "$HEAD_SHA" --format text
+          > rag-fixture-report.txt 2>&1 || true
+
+      - name: Upload the report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-fixture-report
+          path: rag-fixture-report.txt
+          if-no-files-found: ignore

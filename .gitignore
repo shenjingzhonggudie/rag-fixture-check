@@ -1,0 +1,8 @@
+# build output
+/rag-fixture-check
+/rag-fixture-check.exe
+/dist/
+
+# local reports
+rag-fixture-report.txt
+report.json

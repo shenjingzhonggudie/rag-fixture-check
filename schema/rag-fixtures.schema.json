@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/shenjingzhonggudie/rag-fixture-check/main/schema/rag-fixtures.schema.json",
+  "title": "RAG fixture file",
+  "description": "Evaluation cases with literal evidence anchors. The tool reads this file from the head commit of a pull request and verifies that every anchor still resolves.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "cases"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": {
+      "const": 1,
+      "description": "Schema version. Unknown versions are rejected."
+    },
+    "cases": {
+      "type": "array",
+      "maxItems": 5000,
+      "items": { "$ref": "#/$defs/case" }
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "evidence"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Stable identifier, unique within the file. Used in reports and CI annotations.",
+          "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+        },
+        "question": {
+          "type": "string",
+          "maxLength": 4096,
+          "description": "The evaluation question. Shown in reports so reviewers can judge the change."
+        },
+        "evidence": {
+          "type": "array",
+          "maxItems": 200,
+          "description": "Literal anchors. An empty array is allowed but nothing can be verified for the case.",
+          "items": { "$ref": "#/$defs/evidence" }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "exact"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Repo-relative path using forward slashes. Absolute paths, backslashes, colons, empty segments, '.' and '..' segments are rejected.",
+          "pattern": "^(?!/)(?!.*\\\\)(?!.*:)(?!.*//)(?!.*(?:^|/)\\.\\.?(?:/|$))[^\\u0000-\\u001F\\u007F]+$"
+        },
+        "exact": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "description": "Literal text that must appear in the file. Matching is byte-exact after CRLF normalization; no case folding, no whitespace folding."
+        },
+        "prefix": {
+          "type": "string",
+          "maxLength": 4096,
+          "description": "Optional literal text immediately before 'exact'. Used to disambiguate repeated quotes. An empty string means no constraint."
+        },
+        "suffix": {
+          "type": "string",
+          "maxLength": 4096,
+          "description": "Optional literal text immediately after 'exact'. Used to disambiguate repeated quotes. An empty string means no constraint."
+        }
+      }
+    }
+  }
+}

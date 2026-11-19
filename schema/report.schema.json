@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/shenjingzhonggudie/rag-fixture-check/main/schema/report.schema.json",
+  "title": "rag-fixture-check JSON report",
+  "description": "Output of 'rag-fixture-check check --format json'. Field presence is stable; new optional fields may be added in later releases, so consumers should ignore unknown keys.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "tool",
+    "version",
+    "repo",
+    "base",
+    "head",
+    "fixture",
+    "baseline",
+    "summary",
+    "fixtureChanges",
+    "removedCases",
+    "cases",
+    "notes",
+    "disclaimer"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "tool": { "const": "rag-fixture-check" },
+    "version": { "type": "string" },
+    "repo": { "type": "string", "description": "Absolute worktree root that was inspected." },
+    "base": { "type": "string", "pattern": "^[0-9a-f]{40}$|^[0-9a-f]{64}$" },
+    "head": { "type": "string", "pattern": "^[0-9a-f]{40}$|^[0-9a-f]{64}$" },
+    "fixture": { "type": "string", "description": "Repo-relative fixture path, always read from the head commit." },
+    "baseline": {
+      "type": "object",
+      "required": ["present", "readable"],
+      "properties": {
+        "present": { "type": "boolean", "description": "A baseline fixture exists at the base commit." },
+        "readable": { "type": "boolean", "description": "The baseline fixture parsed and validated successfully." }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "cases",
+        "evidence",
+        "intact",
+        "relocated",
+        "missing",
+        "ambiguous",
+        "contextChanged",
+        "fileMissing",
+        "unreadable",
+        "addedCases",
+        "modifiedCases",
+        "removedCases",
+        "needsReview"
+      ],
+      "properties": {
+        "cases": { "type": "integer", "minimum": 0 },
+        "evidence": { "type": "integer", "minimum": 0 },
+        "intact": { "type": "integer", "minimum": 0 },
+        "relocated": { "type": "integer", "minimum": 0 },
+        "missing": { "type": "integer", "minimum": 0 },
+        "ambiguous": { "type": "integer", "minimum": 0 },
+        "contextChanged": { "type": "integer", "minimum": 0 },
+        "fileMissing": { "type": "integer", "minimum": 0 },
+        "unreadable": { "type": "integer", "minimum": 0 },
+        "addedCases": { "type": "integer", "minimum": 0 },
+        "modifiedCases": { "type": "integer", "minimum": 0 },
+        "removedCases": { "type": "integer", "minimum": 0 },
+        "needsReview": {
+          "type": "boolean",
+          "description": "True when at least one anchor is missing, ambiguous, context_changed, file_missing or unreadable. Maps to exit code 1."
+        }
+      }
+    },
+    "fixtureChanges": {
+      "type": "object",
+      "required": ["added", "modified", "removed"],
+      "properties": {
+        "added": { "type": "array", "items": { "type": "string" } },
+        "modified": { "type": "array", "items": { "type": "string" } },
+        "removed": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "removedCases": {
+      "type": "array",
+      "description": "Cases that existed at the base commit and are gone at head. Reported for review; they do not fail the run by themselves.",
+      "items": {
+        "type": "object",
+        "required": ["id", "question", "evidenceCount", "evidencePaths"],
+        "properties": {
+          "id": { "type": "string" },
+          "question": { "type": "string" },
+          "evidenceCount": { "type": "integer", "minimum": 0 },
+          "evidencePaths": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "question", "change", "evidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "question": { "type": "string" },
+          "change": { "enum": ["unchanged", "added", "modified"] },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "index",
+                "path",
+                "status",
+                "oldPath",
+                "newPath",
+                "oldLine",
+                "newLine",
+                "occurrences",
+                "selected",
+                "selectorChanged",
+                "detail"
+              ],
+              "properties": {
+                "index": { "type": "integer", "minimum": 0 },
+                "path": { "type": "string" },
+                "status": {
+                  "enum": [
+                    "intact",
+                    "relocated",
+                    "missing",
+                    "ambiguous",
+                    "context_changed",
+                    "file_missing",
+                    "unreadable"
+                  ]
+                },
+                "oldPath": { "type": "string", "description": "Baseline path; empty for new evidence." },
+                "newPath": { "type": "string", "description": "Target path when a git rename moved the anchor; empty otherwise." },
+                "oldLine": { "type": "integer", "minimum": 0, "description": "1-based line in the base commit, 0 when unknown." },
+                "newLine": { "type": "integer", "minimum": 0, "description": "1-based line in the head commit, 0 when no unique match exists." },
+                "occurrences": { "type": "integer", "minimum": 0, "description": "Total occurrences of the literal quote in the head file." },
+                "selected": { "type": "integer", "minimum": 0, "description": "Occurrences that also satisfy prefix/suffix." },
+                "selectorChanged": { "type": "boolean", "description": "The fixture entry differs from the baseline entry." },
+                "detail": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "notes": { "type": "array", "items": { "type": "string" } },
+    "disclaimer": {
+      "const": "This tool verifies evidence anchoring only. Whether a quote still supports the expected answer is a human review decision."
+    }
+  }
+}
