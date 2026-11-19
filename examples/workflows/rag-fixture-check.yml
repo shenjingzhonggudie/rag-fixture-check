@@ -36,7 +36,7 @@ jobs:
           cache: false
 
       - name: Install rag-fixture-check
-        run: go install github.com/shenjingzhonggudie/rag-fixture-check@v0.1.0
+        run: go install github.com/shenjingzhonggudie/rag-fixture-check@v0.2.0
 
       # Annotations land on the changed files. Exit code 1 fails the job.
       - name: Verify evidence anchors

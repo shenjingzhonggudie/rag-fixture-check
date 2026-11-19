@@ -6,3 +6,8 @@
 # local reports
 rag-fixture-report.txt
 report.json
+
+# python import tool
+__pycache__/
+*.pyc
+.venv/

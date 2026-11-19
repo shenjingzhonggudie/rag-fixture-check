@@ -2,7 +2,7 @@
 
 **Know which RAG evaluation cases your docs PR just broke — before it merges.**
 
-[中文文档](README.zh-CN.md) · [Download v0.1.0](https://github.com/shenjingzhonggudie/rag-fixture-check/releases/tag/v0.1.0) · [CI workflow](examples/workflows/rag-fixture-check.yml)
+[中文文档](README.zh-CN.md) · [Download v0.2.0](https://github.com/shenjingzhonggudie/rag-fixture-check/releases/tag/v0.2.0) · [CI workflow](examples/workflows/rag-fixture-check.yml)
 
 `rag-fixture-check` is a single-binary Go CLI that resolves every evidence anchor in your RAG fixture against the committed tree of a pull request. It tells you exactly which quotes disappeared, which ones moved, which ones became ambiguous, and which `prefix`/`suffix` selectors no longer match.
 
@@ -27,6 +27,7 @@ It is deliberately narrow: **it verifies evidence anchoring, not answer quality.
 - [Fixture changes: added, modified, removed](#fixture-changes-added-modified-removed)
 - [CI adoption path](#ci-adoption-path)
 - [Worked example: refund window 30 → 14 days](#worked-example-refund-window-30--14-days)
+- [Importing a RAGKit evaluation set](#importing-a-ragkit-evaluation-set)
 - [What the test suite covers](#what-the-test-suite-covers)
 - [Boundaries and non-goals](#boundaries-and-non-goals)
 - [Security model](#security-model)
@@ -70,7 +71,7 @@ The demo builds a temporary repository with two commits, breaks a refund window,
 To try real annotated evidence, run the [QASPER smoke test](examples/qasper/README.md). It retrieves six human-annotated evidence paragraphs and compares them across two Git commits with controlled edits.
 
 ```text
-rag-fixture-check 0.1.0
+rag-fixture-check 0.2.0
 repo:     /tmp/rag-fixture-demo-1234567
 base:     4a1c0f0...
 head:     9b7e2d1...
@@ -144,7 +145,7 @@ go build -trimpath -o rag-fixture-check .
 
 Requirements at runtime: a `git` executable in `PATH`. Nothing else — no Python, no embeddings, no network access.
 
-Pin a version in CI with `go install ...@v0.1.0` or a checksummed release asset.
+Pin a version in CI with `go install ...@v0.2.0` or a checksummed release asset.
 
 ## CLI
 
@@ -261,7 +262,7 @@ Stable, versioned (`schemaVersion: 1`), deterministic: the same input produces b
 {
   "schemaVersion": 1,
   "tool": "rag-fixture-check",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "repo": "/repo",
   "base": "4a1c0f0...",
   "head": "9b7e2d1...",
@@ -397,6 +398,99 @@ Other outcomes from the same mechanism:
 | Page deleted | `file_missing` |
 | Quote reworded | `missing` |
 
+## Importing a RAGKit evaluation set
+
+`tools/ragkit_import.py` converts a RAGKit project into the two inputs `check` needs: a fixture and a corpus snapshot. It reuses RAGKit's own `load_file` and `normalize_text`, so every `exact` quote is byte-identical to the text the annotators measured.
+
+RAGKit records quotes and offsets against `normalize_text(load_file(path).text)`. Normalization can change the text itself, including punctuation and whitespace. In the reference pilot, applying the normalized quotes to unchanged raw Markdown reported 459 missing anchors out of 589. Exporting the normalized snapshot yielded 589 intact anchors.
+
+### Requirements
+
+- Python 3.11+ for the importer only; the Go CLI stays dependency-free
+- A RAGKit checkout containing `data/eval/qrels.json`, `data/raw/` and, optionally, `data/eval/annotation_manifest.json`
+- The importer script from the [v0.2.0 source tree](https://github.com/shenjingzhonggudie/rag-fixture-check/tree/v0.2.0). It is also available in the [source archive](https://github.com/shenjingzhonggudie/rag-fixture-check/archive/refs/tags/v0.2.0.zip) if you installed only the checker binary.
+
+### Import
+
+Run the command from the checker source tree. Use the RAGKit Python environment if the checkout needs its installed dependencies. Pass a RAGKit checkout you trust, since the importer executes its loader and normalizer.
+
+```bash
+python tools/ragkit_import.py \
+  --ragkit-root /path/to/ragkit \
+  --output /tmp/ragkit-snapshot
+```
+
+`--ragkit-root` accepts the project root or its `src` directory. The importer puts that directory on `sys.path` and imports `ragkit.loaders.load_file` plus `ragkit.text.normalize.normalize_text` from the checkout — it never re-implements Markdown parsing or normalization.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--qrels` | `data/eval/qrels.json` | evaluation set, relative to the root |
+| `--manifest` | `data/eval/annotation_manifest.json` | annotation manifest; skipped when absent |
+| `--raw-dir` | `data/raw` | raw corpus root |
+| `--corpus-prefix` | `corpus` | snapshot directory that holds the normalized text |
+| `--force` | off | replace a complete prior import with the same corpus prefix |
+
+The output contains full normalized versions of referenced documents, plus the questions and quotes. Commit it only to a repository where those inputs can be shared.
+
+```text
+/tmp/ragkit-snapshot/
+  .rag-fixtures.json     # version 1; every case carries path/exact/prefix/suffix
+  corpus/...             # normalized text, one file per referenced document
+  import-summary.json    # counts, input hashes, problems; no absolute paths
+```
+
+### What the importer guarantees
+
+| Check | Behaviour |
+| --- | --- |
+| Case selection | `needs_review` and no-answer cases are skipped and counted; answers without any evidence are counted separately |
+| Span check | `exact` must equal `normalized[start:end]` byte for byte |
+| Duplicate quotes | prefix/suffix grow from 8 to 256 characters until exactly one occurrence matches the annotated offset; if that never happens the case is reported, never guessed |
+| Paths | portable repo-relative paths, with extra checks for collisions and reserved names |
+| Hashes | when the manifest exists, the qrels SHA-256 and every referenced document's normalized SHA-256 must match |
+| Self-check | every anchor in the finished fixture is re-resolved against the snapshot with the Go matcher's rules before anything is written |
+
+Exit `0` writes the snapshot. Exit `1` reports an invalid case, anchor or normalized document on stderr before writing. Exit `2` covers setup, qrels hash, manifest format, output conflict or filesystem errors.
+
+### Commit a snapshot and compare two versions
+
+In this Bash example, `rag-fixture-check` is already on PATH. The second commit simulates a change to the normalized snapshot. For a full re-import after changing the raw corpus, refresh the RAGKit annotations and manifest first.
+
+```bash
+# 1. Put the snapshot in a throwaway repository.
+mkdir /tmp/ragkit-repro && cd /tmp/ragkit-repro
+git init -b main
+cp -r /tmp/ragkit-snapshot/.rag-fixtures.json /tmp/ragkit-snapshot/corpus .
+git add .rag-fixtures.json corpus
+git -c user.name=Demo -c user.email=demo@example.invalid commit -m "RAGKit snapshot"
+
+# 2. Baseline: both sides are the same commit, so everything must pass.
+rag-fixture-check check --repo . --base HEAD --head HEAD
+# exit 0, intact = number of anchors
+
+# 3. Simulate a documentation edit that invalidates the first quoted evidence.
+python - <<'PY'
+import json
+from pathlib import Path
+
+fixture = json.loads(Path(".rag-fixtures.json").read_text(encoding="utf-8"))
+anchor = fixture["cases"][0]["evidence"][0]
+path = Path(anchor["path"])
+# Replace every occurrence so the case is affected even when the quote repeats.
+path.write_text(path.read_text(encoding="utf-8").replace(anchor["exact"], "Evidence was rewritten."),
+                encoding="utf-8", newline="\n")
+PY
+git -c user.name=Demo -c user.email=demo@example.invalid commit -am "rewrite one piece of evidence"
+
+# 4. Compare the two snapshots.
+rag-fixture-check check --repo . --base HEAD~1 --head HEAD
+# exit 1: the selected evidence is missing; cases that share it can also be flagged
+```
+
+`check` reads committed trees only, so the worktree state is irrelevant. Add `--format github` for PR annotations, or `--format json` to archive the report.
+
+**Acceptance numbers.** The pilot run against the reference RAGKit corpus imported 246 cases and 589 evidence anchors, and the baseline check of that snapshot was fully intact. Those numbers describe that corpus; nothing in the importer is tuned to them or hard-codes them.
+
 ## What the test suite covers
 
 Integration tests run against **real temporary Git repositories** (no mocks), with isolated Git config and deterministic identities:
@@ -424,8 +518,20 @@ Integration tests run against **real temporary Git repositories** (no mocks), wi
 
 Unit tests cover selector semantics, overlapping occurrences, line arithmetic, path validation, revision validation and workflow-command escaping.
 
+The Python importer has its own synthetic-data suite — no RAGKit installation and no real evaluation set involved:
+
+- valid cases imported; no-answer, needs-review and evidence-less cases counted and skipped
+- duplicate quote disambiguated at the annotated occurrence, verified by re-matching the generated selector
+- quote that does not match its annotated span → problem with case id and path, nothing written
+- duplicate quote with identical 256-character context → reported as unresolvable
+- manifest qrels/corpus hash mismatches, uncovered documents, unsafe `../` paths
+- output conflict without `--force`, and `--force` clearing stale snapshot files
+- a fake `ragkit` package under `<root>/src` proving `load_file` and `normalize_text` are really imported from `--ragkit-root`
+- byte-identical fixture and summary across runs
+
 ```bash
 go test ./...
+python -m unittest discover -s tools/tests
 go run ./examples/demo
 ```
 
@@ -458,6 +564,7 @@ gofmt -w .          # the tree is kept gofmt-formatted
 go build ./...
 go vet ./...
 go test ./...       # integration tests need git in PATH
+python -m unittest discover -s tools/tests
 go run ./examples/demo
 ```
 
@@ -471,6 +578,8 @@ internal/gitx/              safe read-only git wrapper
 internal/match/             literal + selector matching
 internal/check/             orchestration, baseline comparison, summary
 internal/report/            text / json / github rendering
+tools/ragkit_import.py      RAGKit evaluation set → fixture + normalized snapshot
+tools/tests/                synthetic-data tests for the importer
 examples/demo/              end-to-end demo on a throwaway repo
 examples/workflows/         copy-paste PR workflow
 schema/                     JSON Schema for fixtures and reports

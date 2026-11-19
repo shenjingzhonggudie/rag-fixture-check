@@ -138,6 +138,56 @@ steps:
 - 两个 SHA 都取事件载荷里的固定值，分支名可能移动。
 - 只需 `contents: read`，不需要任何 secret，fork PR 也能直接跑。
 
+## 导入 RAGKit 评测集（v0.2）
+
+`tools/ragkit_import.py` 把 RAGKit 项目转成 `check` 需要的两个输入：fixture 与规范化语料快照。它直接调用 RAGKit 的 `load_file` 与 `normalize_text`，不自己实现 Markdown 解析或空白归一。
+
+**为什么要快照而不是直接用原始文档。** RAGKit 的标注区间是在 `normalize_text(load_file(path).text)` 上算的；直接拿原始 Markdown 当语料，front matter、HTML 注释、MDX 行、全角归一与行尾空白都会让偏移错位，检查器会把大量有效证据误报成 `missing`（参考实验里 589 条中有 459 条假缺失）。用规范化快照后 589 条全部 `intact`。
+
+从 [v0.2.0 源码压缩包](https://github.com/shenjingzhonggudie/rag-fixture-check/archive/refs/tags/v0.2.0.zip) 解压获得脚本。在源码目录运行，使用 Python 3.11+。导入器会执行所选 RAGKit 项目里的 Python 加载器，请使用你信任的项目。
+
+```powershell
+$snapshot = Join-Path $env:TEMP ("ragkit-snapshot-" + [guid]::NewGuid())
+python tools/ragkit_import.py --ragkit-root "C:\path\to\ragkit" --output $snapshot
+```
+
+`--ragkit-root` 可以指向项目根或它的 `src` 目录。可选用 `--qrels`、`--manifest`、`--raw-dir`、`--corpus-prefix` 覆盖默认布局。`--force` 只替换采用同一语料目录名的完整导入快照。
+
+产物包含题干、原文引文和被引用文档的完整规范化正文。请根据语料授权决定提交范围。
+
+```text
+/tmp/ragkit-snapshot/
+  .rag-fixtures.json     # version 1，每条证据带 path/exact/prefix/suffix
+  corpus/...             # 规范化正文，按被引用的文档一一对应
+  import-summary.json    # 计数、输入哈希、问题列表
+```
+
+导入器保证：
+
+- 只收有效题：`needs_review` 与无答案题分别跳过并计数；有 answer 但没有 evidence 的题单独计数。
+- `exact` 必须与 `normalized[start:end]` 逐字节一致。
+- 引文重复时按标注位置生成 8→256 字符的前缀/后缀，直到唯一命中；做不到就报问题，绝不猜。
+- 路径规则与 Go 侧一致（相对、正斜杠、无 `..`、无冒号、无控制字符）。
+- manifest 存在时校验 qrels 与每篇文档规范化正文的 SHA-256。
+- 写出前用与 Go 相同的匹配规则复验每个锚点，保证产物一定能锚定。
+
+退出码 `0` 表示写出快照。`1` 表示题目、证据或规范化正文校验失败，返回错误且不写入。`2` 表示环境、qrels 哈希、清单格式、输出冲突或文件写入失败。
+
+以下 PowerShell 示例使用 PATH 上的发布版 `rag-fixture-check`。第二次提交要编辑的是规范化快照。以后修改原始语料并重新导入时，需先更新 RAGKit 的标注及清单。
+
+```powershell
+git -C $snapshot init -b main
+git -C $snapshot add -- .rag-fixtures.json corpus
+git -C $snapshot -c user.name=Demo -c user.email=demo@example.invalid commit -m "RAGKit snapshot"
+rag-fixture-check check --repo $snapshot --base HEAD --head HEAD
+
+# 在 $snapshot\corpus 里改写一条已标注的引文，再提交并比较
+git -C $snapshot -c user.name=Demo -c user.email=demo@example.invalid commit -am "Rewrite evidence"
+rag-fixture-check check --repo $snapshot --base 'HEAD~1' --head HEAD
+```
+
+参考实验的验收数字是 246 题 / 589 条证据、基线全部通过；这些数字只描述那次语料，代码里没有写死任何计数。
+
 ## 边界
 
 - **只验证锚定**：不判断答案是否仍然正确、题目是否值得保留、检索排序是否变化。
@@ -154,6 +204,7 @@ gofmt -w .
 go build ./...
 go vet ./...
 go test ./...        # 集成测试需要 git 在 PATH
+python -m unittest discover -s tools/tests
 go run ./examples/demo
 ```
 
