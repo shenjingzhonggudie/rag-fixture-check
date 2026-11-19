@@ -60,7 +60,17 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Build the checker for end-to-end tests
+        run: go build -trimpath -o "$RUNNER_TEMP/rag-fixture-check" .
+
       # The importer tests use synthetic data and a fake `ragkit` package, so
       # no RAGKit checkout or network access is required.
       - name: importer tests
+        env:
+          RAG_FIXTURE_CHECK_BIN: ${{ runner.temp }}/rag-fixture-check
         run: python -m unittest discover -s tools/tests -v

@@ -138,13 +138,13 @@ steps:
 - 两个 SHA 都取事件载荷里的固定值，分支名可能移动。
 - 只需 `contents: read`，不需要任何 secret，fork PR 也能直接跑。
 
-## 导入 RAGKit 评测集（v0.2）
+## 导入与刷新 RAGKit 评测集（v0.3）
 
 `tools/ragkit_import.py` 把 RAGKit 项目转成 `check` 需要的两个输入：fixture 与规范化语料快照。它直接调用 RAGKit 的 `load_file` 与 `normalize_text`，不自己实现 Markdown 解析或空白归一。
 
 **为什么要快照而不是直接用原始文档。** RAGKit 的标注区间是在 `normalize_text(load_file(path).text)` 上算的；直接拿原始 Markdown 当语料，front matter、HTML 注释、MDX 行、全角归一与行尾空白都会让偏移错位，检查器会把大量有效证据误报成 `missing`（参考实验里 589 条中有 459 条假缺失）。用规范化快照后 589 条全部 `intact`。
 
-从 [v0.2.0 源码压缩包](https://github.com/shenjingzhonggudie/rag-fixture-check/archive/refs/tags/v0.2.0.zip) 解压获得脚本。在源码目录运行，使用 Python 3.11+。导入器会执行所选 RAGKit 项目里的 Python 加载器，请使用你信任的项目。
+从 [v0.3.0 源码压缩包](https://github.com/shenjingzhonggudie/rag-fixture-check/archive/refs/tags/v0.3.0.zip) 解压获得脚本。在源码目录运行，使用 Python 3.11+。导入器会执行所选 RAGKit 项目里的 Python 加载器，请使用你信任的项目。
 
 ```powershell
 $snapshot = Join-Path $env:TEMP ("ragkit-snapshot-" + [guid]::NewGuid())
@@ -173,20 +173,76 @@ python tools/ragkit_import.py --ragkit-root "C:\path\to\ragkit" --output $snapsh
 
 退出码 `0` 表示写出快照。`1` 表示题目、证据或规范化正文校验失败，返回错误且不写入。`2` 表示环境、qrels 哈希、清单格式、输出冲突或文件写入失败。
 
-以下 PowerShell 示例使用 PATH 上的发布版 `rag-fixture-check`。第二次提交要编辑的是规范化快照。以后修改原始语料并重新导入时，需先更新 RAGKit 的标注及清单。
+### 文档改动后刷新
+
+文档改动可能使旧引文或 manifest 校验失败。`refresh` 逐字节复制旧 fixture，只按旧路径重建语料。
+
+| 情况 | 结果 |
+| --- | --- |
+| fixture | 逐字节复制，题号 / 引文 / 前后文选择器不变 |
+| 旧引文已不存在 | 刷新成功，`check` 报 `missing` |
+| 源文件被删除 | 新快照省略该文件，`check` 报 `file_missing` |
+| 源文件被重命名 | 本轮按旧路径缺失处理 |
+| 权限 / 解码 / 路径 / 写入失败 | 退出 2 并指出路径，绝不伪装成删除 |
+| manifest | 不校验（它描述的是旧语料） |
+| 输出目录 | 使用独立目录。加 `--force` 可覆盖采用同一语料目录名的完整刷新快照 |
+
+`refresh-summary.json` 记录 `counts.rebuilt`、`missingPaths` 与冻结 fixture 的 SHA-256。退出码只有 `0`（成功，允许缺失源文件）与 `2`（输入或环境不可用）。
+
+完整流程：导入基线 → 改原始 Markdown → refresh → 提交第二份快照 → check。
 
 ```powershell
+# 1. 提交基线快照
 git -C $snapshot init -b main
 git -C $snapshot add -- .rag-fixtures.json corpus
 git -C $snapshot -c user.name=Demo -c user.email=demo@example.invalid commit -m "RAGKit snapshot"
-rag-fixture-check check --repo $snapshot --base HEAD --head HEAD
+rag-fixture-check check --repo $snapshot --base HEAD --head HEAD   # 退出 0
 
-# 在 $snapshot\corpus 里改写一条已标注的引文，再提交并比较
-git -C $snapshot -c user.name=Demo -c user.email=demo@example.invalid commit -am "Rewrite evidence"
-rag-fixture-check check --repo $snapshot --base 'HEAD~1' --head HEAD
+# 2. 修改 RAGKit 里的原始 Markdown，然后只重建语料
+$refreshed = Join-Path $env:TEMP ("ragkit-refresh-" + [guid]::NewGuid())
+python tools/ragkit_import.py refresh --ragkit-root "C:\path\to\ragkit" `
+  --baseline $snapshot --output $refreshed
+if ($LASTEXITCODE -ne 0) { throw "Refresh failed" }
+
+# 3. 用新快照替换 corpus 并提交
+git -C $snapshot rm -r -- corpus
+if ($LASTEXITCODE -ne 0) { throw "Could not replace the scratch corpus" }
+Copy-Item -Recurse -LiteralPath (Join-Path $refreshed "corpus") -Destination $snapshot -ErrorAction Stop
+Copy-Item -LiteralPath (Join-Path $refreshed "refresh-summary.json") -Destination $snapshot -ErrorAction Stop
+git -C $snapshot add -A -- corpus refresh-summary.json
+git -C $snapshot -c user.name=Demo -c user.email=demo@example.invalid commit -m "Refresh after docs change"
+
+# 4. 比较两个提交
+rag-fixture-check check --repo $snapshot --base 'HEAD~1' --head HEAD   # 受影响题 missing / file_missing，退出 1
 ```
 
-参考实验的验收数字是 246 题 / 589 条证据、基线全部通过；这些数字只描述那次语料，代码里没有写死任何计数。
+核对源文档 PR 时，用 `--raw-dir` 指向 PR 工作区的原始语料，并把 `--ragkit-root` 指向生成基线时所用的可信加载器版本。仓库自带的 GitHub 工作流读取已提交的 fixture 和文档。生成快照的路径是 `corpus/…`，可用文本或 JSON 报告复核。
+
+参考实验的验收数字是 246 题 / 589 条证据、基线 589 条全部 `intact`；改写一页并删除一页后，refresh 重建 78 篇、省略 1 篇，fixture 在两个提交里逐字节相同，`check` 退出 1（586 intact、1 missing、2 file_missing）。这些数字只描述那次语料，代码里没有写死任何计数。
+
+### 一条命令校验 PR（verify）
+
+```powershell
+python tools/ragkit_import.py verify `
+  --ragkit-root "C:\path\to\trusted-ragkit" `
+  --baseline $snapshot `
+  --raw-dir "C:\path\to\pr\data\raw" `
+  --checker "C:\path\to\rag-fixture-check.exe" `
+  --report ".\verify-report.json"
+```
+
+- 冻结 fixture 来自 `--baseline`，语料来自 `--raw-dir`，加载器来自 `--ragkit-root`（可信代码）；PR 只提供文档。
+- 在系统临时目录里建基线提交与 PR 提交并调用 `check`，不碰当前工作区与 Git 配置；两份提交的 fixture 字节必须相同。
+- 退出码 `0` 表示全部有效，`1` 表示有证据需复核。两种情况都会生成报告。`2` 表示输入、读取、Git、检查器或报告写入失败，原有报告会保留。
+- 源文件读不出来（权限、解码、路径是目录）一律退出 2，绝不降级成 `file_missing`；两份快照完全相同时仍返回 0。
+- 报告包含 fixture 哈希、受影响题号和完整的 `check` 结果。`commits` 记录临时仓库的两个快照提交。
+
+使用 [GitHub Actions 示例](examples/workflows/verify-ragkit-evidence.yml) 时，把基线快照提交到 base 分支的 `rag-snapshot/`，可信加载器放在 `src/ragkit/`，原始文档放在 `data/raw/`。通过仓库变量（Settings → Secrets and variables → Actions → Variables）或直接编辑模板的 `env:` 设置两项：
+
+- `RAG_FIXTURE_CHECK_REF`（必需）：包含 `verify` 的已审阅工具提交，必须是**完整 40 位 SHA**；标签、分支和短 SHA 会在任何 checkout 之前被拒绝。
+- `RAG_FIXTURE_CHECK_REPO`（可选）：工具仓库的 `owner/name`，默认 `shenjingzhonggudie/rag-fixture-check`，便于 fork、镜像与发布前验收。
+
+示例从 base 提交加载 Python，PR 工作区仅提供原始文档。若 `data/raw` 未纳入 Git，先从固定制品、内容摘要或语料仓库提交获取已审阅的 PR 语料版本，再通过 `GITHUB_ENV` 将其绝对路径设为 `RAW_DIR`。报告包含基线题干和证据路径，请在允许共享这些内容的仓库运行。
 
 ## 边界
 

@@ -1,13 +1,36 @@
 #!/usr/bin/env python3
-"""RAGKit 评测集导入器：把 RAGKit 的 qrels 转成 rag-fixture-check 的 fixture 快照。
+"""RAGKit 评测集工具：导入题集、刷新语料，或直接校验文档 PR。
+
+三种模式
+--------
+``import``（默认，v0.2 行为）
+    从 qrels 生成 fixture 与规范化语料快照：
+
+        python tools/ragkit_import.py --ragkit-root <root> --output <snapshot>
+
+``refresh``（v0.3）
+    冻结旧快照的 fixture，只重建语料：
+
+        python tools/ragkit_import.py refresh --ragkit-root <root> \
+            --baseline <old-snapshot> --output <new-snapshot>
+
+``verify``（v0.3）
+    一条命令校验 PR 原始文档是否破坏已有证据：冻结 fixture 来自旧快照，语料
+    来自 PR 的原始文档，比较在一次性 Git 仓库里完成：
+
+        python tools/ragkit_import.py verify --ragkit-root <trusted-loader> \
+            --baseline <old-snapshot> --raw-dir <pr-raw-docs> \
+            --checker <rag-fixture-check> --report <report.json>
 
 职责边界
 --------
-- 只读 RAGKit 项目（qrels、annotation manifest、``data/raw`` 语料）；
-- 只写 ``--output`` 目录下的 ``.rag-fixtures.json``、``corpus/`` 与 ``import-summary.json``；
+- 只读 RAGKit 项目（qrels、annotation manifest、``data/raw`` 语料）、旧快照
+  与 PR 原始语料；
+- ``import``/``refresh`` 只写 ``--output`` 目录；``verify`` 只写 ``--report``，
+  快照与 Git 操作全部发生在系统临时目录；
 - 语料正文一律来自 RAGKit 的 ``load_file`` + ``normalize_text``，本文件不实现
   任何 Markdown 解析、front matter 剥离或空白归一；
-- 不修改 RAGKit，不联网，不调用 git，不写 ``--output`` 之外的路径。
+- 不修改 RAGKit，不联网；``verify`` 只在临时仓库里调用 git，不碰调用者工作区。
 
 为什么需要规范化快照
 --------------------
@@ -17,8 +40,15 @@ RAGKit 的标注区间是在 ``normalize_text(load_file(path).text)`` 上算出�
 因此把"规范化后的正文"落成快照，fixture 里的 ``path`` 指向快照内部
 （``corpus/...``），而不是原始文档路径。
 
-承诺清单
---------
+为什么需要 refresh
+------------------
+文档改动后，旧 qrels 的引文与 manifest 摘要都会失效。若重新跑 ``import``，会被
+旧引文或 manifest 校验挡住。``refresh`` 逐字节复制旧 fixture、只按旧路径重建
+语料，于是旧引文能进入比较流程，由 Go ``check`` 报出哪些题受影响（``missing``、
+``context_changed``），源文件被删除的路径则报 ``file_missing``。
+
+承诺清单（import）
+------------------
 1. fixture 只包含有效题：无答案题与 ``needs_review`` 题分别跳过并计数；
 2. 每条 evidence 的 ``exact`` 必须与标注区间 ``[start, end)`` 逐字节一致，
    否则记录问题并以退出码 1 结束；
@@ -27,30 +57,53 @@ RAGKit 的标注区间是在 ``normalize_text(load_file(path).text)`` 上算出�
    快照"或让旧快照与失败摘要混在一起；
 5. 输出里不出现本机绝对路径，便于把快照提交进仓库。
 
+承诺清单（refresh）
+------------------
+1. fixture 逐字节复制，题号、引文与前后文选择器一律不改；
+2. 旧引文不存在时刷新仍然成功，失效由 ``check`` 报 ``missing``；
+3. 源文件确实不存在 → 新快照省略该文件（``check`` 报 ``file_missing``）；
+   权限、解码、路径、写入失败 → 退出码 2，绝不伪装成删除；
+4. 源文件重命名本轮按"旧路径缺失"处理；
+5. 不校验 annotation manifest（它描述的是旧语料）；
+6. 输出必须是新目录，且不得与旧快照重叠。
+
+承诺清单（verify）
+------------------
+1. 复用 refresh 的冻结与重建逻辑，fixture 字节在两个提交里必须完全相同；
+2. 比较发生在系统临时目录的一次性 Git 仓库里，调用者的工作区与配置不受影响；
+3. 旧快照、可信加载器与 PR 原始语料全程只读；
+4. 完整 JSON 报告写到 ``--report``；退出 1 时报告一定已经落盘；
+5. 读取失败（权限、解码、路径）退出 2，绝不降级成 ``file_missing``；
+6. 两份快照完全相同时仍然创建两个提交并跑通，返回 0。
+
 退出码
 ------
-0 导入成功；1 有无法定位/校验失败的证据；2 环境或输入不可用（RAGKit 导入失败、
-qrels 摘要不匹配、输出目录冲突等）。
+0 成功；1 导入时有无法定位/校验失败的证据，或 verify 发现需复核的证据；2
+环境或输入不可用（RAGKit 导入失败、qrels 摘要不匹配、输出目录冲突、源文档
+读取失败、Git/检查器执行失败等）。``refresh`` 只返回 0 或 2。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib
 import json
+import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 TOOL = "ragkit-fixture-import"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SCHEMA_VERSION = 1
 
 DEFAULT_QRELS = Path("data/eval/qrels.json")
@@ -59,6 +112,9 @@ DEFAULT_RAW_DIR = Path("data/raw")
 DEFAULT_CORPUS_PREFIX = "corpus"
 FIXTURE_NAME = ".rag-fixtures.json"
 SUMMARY_NAME = "import-summary.json"
+REFRESH_SUMMARY_NAME = "refresh-summary.json"
+REFRESH_MODE = "refresh"
+VERIFY_MODE = "verify"
 
 EXIT_OK = 0
 EXIT_REVIEW = 1
@@ -218,6 +274,88 @@ class ImportResult:
             int: 无问题为 0，存在问题为 1。
         """
         return EXIT_OK if not self.problems else EXIT_REVIEW
+
+
+@dataclass(frozen=True)
+class RefreshOptions:
+    """一次语料刷新的路径与开关。
+
+    Args:
+        root: RAGKit 项目根目录的绝对路径，只读。
+        baseline: 旧快照目录的绝对路径，只读。
+        output: 新快照目录的绝对路径；必须与 baseline 不重叠。
+        raw_dir: 原始语料目录绝对路径，默认 ``<root>/data/raw``。
+        force: 是否允许替换输出目录里已有的 refresh 快照。
+
+    Notes:
+        这里没有 ``corpus_prefix``：快照内的语料目录名由旧 fixture 的路径推导。
+        refresh 逐字节复制 fixture，因此也不能改路径前缀，否则新快照会自相矛盾。
+    """
+
+    root: Path
+    baseline: Path
+    output: Path
+    raw_dir: Path
+    force: bool = False
+
+
+@dataclass
+class RefreshResult:
+    """一次刷新的完整结果，供写盘与打印使用。
+
+    Args:
+        fixture_bytes: 从旧快照逐字节复制的 fixture。
+        corpus: 新快照路径 → 重新规范化后的正文。
+        missing_paths: 源文件确实不存在、因而被省略的快照路径（升序）。
+        summary: ``refresh-summary.json`` 的内容。
+
+    Notes:
+        缺失路径不是错误：它们让 Go ``check`` 报 ``file_missing``。只有读取
+        失败（权限、解码、路径）才会让 refresh 以退出码 2 结束。
+    """
+
+    fixture_bytes: bytes
+    corpus: dict[str, str]
+    missing_paths: list[str]
+    summary: dict
+
+
+@dataclass(frozen=True)
+class VerifyOptions:
+    """一次 PR 证据校验的输入。
+
+    Args:
+        root: 可信的 RAGKit 加载器项目根目录，只读。
+        baseline: 旧快照目录（含冻结 fixture 与基线语料），只读。
+        raw_dir: PR 版本的原始语料目录，只读。
+        checker: ``rag-fixture-check`` 可执行文件路径。
+        report: 完整 JSON 报告的输出路径。
+
+    Notes:
+        ``raw_dir`` 与 ``root`` 分开，是为了让加载器只来自可信代码，PR 只提供
+        数据。verify 不接受 ``--force``：它不写快照，只写报告。
+    """
+
+    root: Path
+    baseline: Path
+    raw_dir: Path
+    checker: Path
+    report: Path
+
+
+@dataclass
+class VerifyResult:
+    """一次 PR 证据校验的结果。
+
+    Args:
+        report: 要写入 ``--report`` 的完整报告。
+        exit_code: 0 表示全部有效，1 表示有证据需要复核。
+        affected: 受影响的题号、状态与原问题，供终端打印。
+    """
+
+    report: dict
+    exit_code: int
+    affected: list[dict]
 
 
 class RagkitBackend:
@@ -726,7 +864,7 @@ def check_fixture_limits(cases: Sequence[dict]) -> list[Problem]:
             )
         if len(case["id"].encode("utf-8")) > MAX_ID_BYTES:
             problems.append(Problem(case["id"], "", f"case id is longer than {MAX_ID_BYTES} bytes"))
-        if len(case["question"].encode("utf-8")) > MAX_QUESTION_BYTES:
+        if len(case.get("question", "").encode("utf-8")) > MAX_QUESTION_BYTES:
             problems.append(Problem(case["id"], "", f"query is longer than {MAX_QUESTION_BYTES} bytes"))
         if any(ord(char) < 0x20 or ord(char) == 0x7F for char in case["id"]):
             problems.append(Problem(case["id"], "", "case id contains control characters"))
@@ -1037,7 +1175,7 @@ def resolve_options(args: argparse.Namespace) -> ImportOptions:
         raise InputError(f"--corpus-prefix is invalid: {exc}") from exc
     if "/" in corpus_prefix:
         raise InputError("--corpus-prefix must be a single path segment")
-    if corpus_prefix.casefold() in {FIXTURE_NAME, SUMMARY_NAME, LOCK_NAME}:
+    if corpus_prefix.casefold() in {FIXTURE_NAME, SUMMARY_NAME, REFRESH_SUMMARY_NAME, LOCK_NAME}:
         raise InputError("--corpus-prefix is reserved for an importer file")
     return ImportOptions(
         root=root,
@@ -1114,34 +1252,56 @@ def _json_bytes(value: dict) -> bytes:
     return (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
-def write_snapshot(options: ImportOptions, result: ImportResult) -> None:
-    """Stage all artifacts first and keep the old snapshot until replacement succeeds."""
-    output = options.output
+def _install_snapshot(
+    output: Path,
+    corpus_prefix: str,
+    existing_outputs: Callable[[], Sequence[str]],
+    corpus: dict[str, str],
+    documents: dict[str, bytes],
+) -> None:
+    """把已构造好的快照暂存后整体换进输出目录。
+
+    Args:
+        output: 输出目录；不存在时创建。
+        corpus_prefix: 语料子目录名，例如 ``corpus``。
+        existing_outputs: 在持锁时重新验证、返回可替换的快照条目。
+        corpus: 快照路径 → 正文。
+        documents: 输出根目录下的 JSON 文件名 → 原始字节。
+
+    Raises:
+        OSError: 写入、改名或回滚失败。
+
+    Notes:
+        先在同一目录下建 staging，把全部内容写完后才改名替换；中途失败会把已经
+        换上去的条目搬回 staging、把旧条目搬回原位。回滚本身失败时保留 staging
+        并在错误里给出路径，避免静默丢数据。
+    """
     output.mkdir(parents=True, exist_ok=True)
     lock = output / LOCK_NAME
     lock.mkdir()
     stage = None
     keep_backup = False
     try:
-        existing = _existing_outputs(options)
+        existing = existing_outputs()
         stage = Path(tempfile.mkdtemp(prefix=".ragkit-stage-", dir=output))
         incoming = stage / "incoming"
         backup = stage / "previous"
-        (incoming / options.corpus_prefix).mkdir(parents=True)
+        (incoming / corpus_prefix).mkdir(parents=True)
         backup.mkdir()
-        for repo_path, content in sorted(result.corpus.items()):
+        for repo_path, content in sorted(corpus.items()):
             target = incoming.joinpath(*repo_path.split("/"))
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("xb") as stream:
                 stream.write(content.encode("utf-8"))
-        (incoming / FIXTURE_NAME).write_bytes(_json_bytes(result.fixture))
-        (incoming / SUMMARY_NAME).write_bytes(_json_bytes(result.summary))
+        for name, data in documents.items():
+            with (incoming / name).open("xb") as stream:
+                stream.write(data)
         moved, installed = [], []
         try:
             for name in existing:
                 (output / name).rename(backup / name)
                 moved.append(name)
-            for name in (options.corpus_prefix, FIXTURE_NAME, SUMMARY_NAME):
+            for name in [corpus_prefix, *documents]:
                 (incoming / name).rename(output / name)
                 installed.append(name)
         except OSError:
@@ -1160,6 +1320,29 @@ def write_snapshot(options: ImportOptions, result: ImportResult) -> None:
                 shutil.rmtree(stage)
         finally:
             lock.rmdir()
+
+
+def write_snapshot(options: ImportOptions, result: ImportResult) -> None:
+    """把导入结果写入快照目录。
+
+    Args:
+        options: 导入选项，提供输出目录、语料前缀与 ``--force``。
+        result: 导入结果。
+
+    Raises:
+        InputError: 输出目录已有快照且不满足替换条件。
+        OSError: 写入失败。
+    """
+    _install_snapshot(
+        options.output,
+        options.corpus_prefix,
+        lambda: _existing_outputs(options),
+        result.corpus,
+        {
+            FIXTURE_NAME: _json_bytes(result.fixture),
+            SUMMARY_NAME: _json_bytes(result.summary),
+        },
+    )
 
 
 def print_report(options: ImportOptions, result: ImportResult) -> None:
@@ -1202,6 +1385,917 @@ def print_report(options: ImportOptions, result: ImportResult) -> None:
         print("status:       ok")
 
 
+def parse_frozen_fixture(data: bytes) -> dict:
+    """解析旧快照里的 fixture，提取可安全复用的结构。
+
+    Args:
+        data: 旧 ``.rag-fixtures.json`` 的原始字节。
+
+    Returns:
+        dict: 解析后的 fixture 文档。
+
+    Raises:
+        InputError: 文档过大、不是合法 JSON、版本不是 1，或证据字段不合法。
+
+    Notes:
+        refresh 不重算引文，也不判断引文是否还存在；这里只保证"每条 evidence
+        都能读出 path，且结构满足 Go 侧的 fixture 契约"。结构坏掉必须在这里
+        失败，而不是等 Go ``check`` 用退出码 2 告诉用户。
+    """
+    if len(data) > MAX_FIXTURE_BYTES:
+        raise InputError(f"baseline fixture exceeds {MAX_FIXTURE_BYTES} bytes")
+    try:
+        fixture = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InputError(f"baseline fixture is not valid JSON: {exc}") from exc
+    if not isinstance(fixture, dict):
+        raise InputError("baseline fixture must be a JSON object")
+    if set(fixture) - {"$schema", "version", "cases"}:
+        raise InputError("baseline fixture contains unknown fields")
+    if not _is_int(fixture.get("version")) or fixture["version"] != 1:
+        raise InputError("baseline fixture must have version 1")
+    if not isinstance(fixture.get("$schema", ""), str):
+        raise InputError("baseline fixture $schema must be a string")
+    cases = fixture.get("cases")
+    if not isinstance(cases, list):
+        raise InputError("baseline fixture must contain a cases array")
+    seen_ids: set[str] = set()
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict):
+            raise InputError(f"baseline fixture cases[{index}] is not an object")
+        if set(case) - {"id", "question", "evidence"}:
+            raise InputError(f"baseline fixture cases[{index}] contains unknown fields")
+        case_id = case.get("id")
+        if not isinstance(case_id, str) or not case_id:
+            raise InputError(f"baseline fixture cases[{index}] has no id")
+        if case_id in seen_ids:
+            raise InputError(f"baseline fixture has duplicate case id {case_id!r}")
+        seen_ids.add(case_id)
+        if not isinstance(case.get("question", ""), str):
+            raise InputError(f"baseline fixture case {case_id!r} question is not a string")
+        evidence = case.get("evidence")
+        if not isinstance(evidence, list):
+            raise InputError(f"baseline fixture case {case_id!r} has no evidence array")
+        for position, item in enumerate(evidence):
+            if not isinstance(item, dict):
+                raise InputError(f"baseline fixture case {case_id!r} evidence[{position}] is not an object")
+            if set(item) - {"path", "exact", "prefix", "suffix"}:
+                raise InputError(f"baseline fixture case {case_id!r} evidence[{position}] contains unknown fields")
+            path = item.get("path")
+            if not isinstance(path, str):
+                raise InputError(f"baseline fixture case {case_id!r} evidence[{position}] has no path")
+            try:
+                validate_repo_path(path)
+            except ValueError as exc:
+                raise InputError(
+                    f"baseline fixture case {case_id!r} evidence[{position}] path: {exc}"
+                ) from exc
+            exact = item.get("exact")
+            if not isinstance(exact, str) or not exact:
+                raise InputError(f"baseline fixture case {case_id!r} evidence[{position}] has no exact quote")
+            if len(exact.encode("utf-8")) > MAX_EXACT_BYTES:
+                raise InputError(f"baseline fixture case {case_id!r} evidence[{position}] exact is too long")
+            for selector in ("prefix", "suffix"):
+                value = item.get(selector, "")
+                if not isinstance(value, str):
+                    raise InputError(
+                        f"baseline fixture case {case_id!r} evidence[{position}] {selector} is not a string"
+                    )
+                if len(value.encode("utf-8")) > MAX_CONTEXT_BYTES:
+                    raise InputError(
+                        f"baseline fixture case {case_id!r} evidence[{position}] {selector} is too long"
+                    )
+    limits = check_fixture_limits(cases)
+    if limits:
+        raise InputError("baseline fixture violates limits: " + "; ".join(problem.reason for problem in limits))
+    return fixture
+
+
+def fixture_paths(fixture: dict) -> list[str]:
+    """按首次出现顺序返回 fixture 引用的快照路径（去重）。
+
+    Args:
+        fixture: 已通过 :func:`parse_frozen_fixture` 的文档。
+
+    Returns:
+        list[str]: 需要重建的快照路径。
+
+    Notes:
+        顺序只影响重建与摘要，不影响 fixture 字节；去重避免同一文档被重复
+        加载、重复写入。
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for case in fixture["cases"]:
+        for item in case["evidence"]:
+            path = item["path"]
+            if path not in seen:
+                seen.add(path)
+                ordered.append(path)
+    return ordered
+
+
+def split_corpus_paths(paths: Sequence[str]) -> tuple[str, list[tuple[str, str]]]:
+    """把快照路径拆成语料前缀与 ``(doc, 快照路径)`` 列表。
+
+    Args:
+        paths: :func:`fixture_paths` 的结果。
+
+    Returns:
+        tuple: ``(prefix, entries)``；没有路径时前缀回退为 ``corpus``。
+
+    Raises:
+        InputError: 路径没有语料前缀段，或同一份 fixture 混用了多个前缀。
+
+    Notes:
+        refresh 不接收 ``--corpus-prefix``：前缀必须与冻结 fixture 一致，
+        否则复制过来的 fixture 会指向一个不存在的目录。
+    """
+    if not paths:
+        return DEFAULT_CORPUS_PREFIX, []
+    prefix: str | None = None
+    entries: list[tuple[str, str]] = []
+    portable_paths: set[str] = set()
+    for path in paths:
+        head, separator, rest = path.partition("/")
+        if not separator or not rest:
+            raise InputError(f"fixture path has no corpus prefix: {path}")
+        if head.casefold() in {FIXTURE_NAME, SUMMARY_NAME, REFRESH_SUMMARY_NAME, LOCK_NAME}:
+            raise InputError(f"fixture path has a reserved corpus prefix: {path}")
+        if path.casefold() in portable_paths:
+            raise InputError(f"fixture paths conflict ignoring case: {path}")
+        portable_paths.add(path.casefold())
+        if prefix is None:
+            prefix = head
+        elif head != prefix:
+            raise InputError(f"fixture mixes corpus prefixes {prefix!r} and {head!r}")
+        entries.append((rest, path))
+    return prefix or DEFAULT_CORPUS_PREFIX, entries
+
+
+def _regular_source(path: Path, root: Path, repo_path: str) -> bool:
+    """Return false for absent files and reject unreadable or non-regular entries."""
+    try:
+        cursor = root
+        info = cursor.stat()
+        for segment in path.relative_to(root).parts:
+            if not stat.S_ISDIR(info.st_mode):
+                raise InputError(f"cannot read {repo_path}: source parent is not a directory")
+            cursor /= segment
+            try:
+                info = cursor.lstat()
+            except FileNotFoundError:
+                return False
+            if stat.S_ISLNK(info.st_mode) or (
+                getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise InputError(f"cannot read {repo_path}: path contains a symlink or junction")
+    except (OSError, ValueError) as exc:
+        raise InputError(f"cannot read {repo_path}: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise InputError(f"cannot read {repo_path}: {path} is not a regular file")
+    return True
+
+
+def _read_source(raw_path: Path, raw_root: Path, repo_path: str, backend: RagkitBackend) -> str | None:
+    """读取并规范化一篇源文档，区分"不存在"与"读不出来"。
+
+    Args:
+        raw_path: 源文件绝对路径。
+        raw_root: 已解析的原始语料根目录，用于越界检查。
+        repo_path: 快照内路径，仅用于报错定位。
+        backend: RAGKit 后端。
+
+    Returns:
+        str | None: 规范化正文；源文件确实不存在时返回 ``None``。
+
+    Raises:
+        InputError: 路径越界、不是普通文件、符号链接悬空，或读取/解码失败。
+
+    Notes:
+        "文件不存在"与"读不出来"必须严格区分：前者让新快照省略该文件，由
+        Go ``check`` 报 ``file_missing``；后者必须让 refresh 以退出码 2 结束，
+        否则权限、编码或路径事故会被伪装成文档删除。
+    """
+    if not _regular_source(raw_path, raw_root, repo_path):
+        return None
+    try:
+        body = backend.normalized_text(raw_path)
+    except Exception as exc:  # noqa: BLE001 - 加载/解码失败必须原样暴露
+        raise InputError(f"cannot read {repo_path}: {exc}") from exc
+    if len(body.encode("utf-8")) > MAX_BLOB_BYTES:
+        raise InputError(f"cannot read {repo_path}: normalized document exceeds {MAX_BLOB_BYTES} bytes")
+    return body
+
+
+def prepare_refresh(baseline: Path) -> tuple[bytes, dict, str, list[tuple[str, str]]]:
+    """读取冻结 fixture，推导语料前缀与需要重建的文档清单。
+
+    Args:
+        baseline: 旧快照目录，只读。
+
+    Returns:
+        tuple: ``(fixture 字节, 解析结果, 语料前缀, [(doc, 快照路径)])``。
+
+    Raises:
+        InputError: fixture 缺失、超限、结构损坏或包含非法路径。
+
+    Notes:
+        ``refresh`` 与 ``verify`` 共用这段读取逻辑，保证两者对"冻结"的理解
+        完全一致：fixture 只读、只解析，不重算任何引文。
+    """
+    fixture_path = baseline / FIXTURE_NAME
+    try:
+        with fixture_path.open("rb") as stream:
+            fixture_bytes = stream.read(MAX_FIXTURE_BYTES + 1)
+    except OSError as exc:
+        raise InputError(f"cannot read baseline fixture {fixture_path}: {exc}") from exc
+    fixture = parse_frozen_fixture(fixture_bytes)
+    prefix, entries = split_corpus_paths(fixture_paths(fixture))
+    return fixture_bytes, fixture, prefix, entries
+
+
+def rebuild_corpus(
+    fixture_bytes: bytes,
+    fixture: dict,
+    prefix: str,
+    entries: Sequence[tuple[str, str]],
+    raw_dir: Path,
+    backend: RagkitBackend,
+) -> RefreshResult:
+    """按重建清单重新规范化语料，不写盘。
+
+    Args:
+        fixture_bytes: 冻结 fixture 的原始字节。
+        fixture: 解析后的 fixture 文档。
+        prefix: 语料目录名，来自冻结 fixture 的路径。
+        entries: ``(doc, 快照路径)`` 列表。
+        raw_dir: 本次要读取的原始语料根目录。
+        backend: 文档加载与归一后端。
+
+    Returns:
+        RefreshResult: 新语料、缺失路径与摘要。
+
+    Raises:
+        InputError: 某篇源文档读取失败（权限、解码、路径）。
+
+    Notes:
+        源文件确实不存在只记入 ``missing_paths``，交给 Go ``check`` 报
+        ``file_missing``；读取失败则直接抛错，不允许退化成"删除"。
+    """
+    raw_root = raw_dir.resolve()
+    corpus: dict[str, str] = {}
+    missing: list[str] = []
+    for doc, repo_path in entries:
+        body = _read_source(raw_dir.joinpath(*doc.split("/")), raw_root, repo_path, backend)
+        if body is None:
+            missing.append(repo_path)
+        else:
+            corpus[repo_path] = body
+
+    anchors = sum(len(case["evidence"]) for case in fixture["cases"])
+    summary = {
+        "schemaVersion": SCHEMA_VERSION,
+        "tool": TOOL,
+        "version": VERSION,
+        "mode": REFRESH_MODE,
+        "status": "ok",
+        "frozenFixture": {
+            "path": FIXTURE_NAME,
+            "sha256": hashlib.sha256(fixture_bytes).hexdigest(),
+            "cases": len(fixture["cases"]),
+            "anchors": anchors,
+        },
+        "counts": {
+            "cases": len(fixture["cases"]),
+            "anchors": anchors,
+            "documents": len(entries),
+            "rebuilt": len(corpus),
+            "missing": len(missing),
+        },
+        "missingPaths": sorted(missing),
+        "outputs": {"fixture": FIXTURE_NAME, "corpus": prefix, "summary": REFRESH_SUMMARY_NAME},
+    }
+    return RefreshResult(
+        fixture_bytes=fixture_bytes,
+        corpus=corpus,
+        missing_paths=sorted(missing),
+        summary=summary,
+    )
+
+
+def run_refresh(options: RefreshOptions, backend: RagkitBackend) -> RefreshResult:
+    """重建旧快照引用的规范化语料，fixture 原样复制。
+
+    Args:
+        options: 路径与开关。
+        backend: 文档加载与归一后端。
+
+    Returns:
+        RefreshResult: 冻结 fixture 字节、新语料、缺失路径与摘要。
+
+    Raises:
+        InputError: 基线 fixture 不可用、输出与基线重叠，或源文档读取失败。
+
+    Notes:
+        不校验 annotation manifest：它记录的是旧语料，文档改动后必然不匹配；
+        refresh 的职责正是让旧引文进入比较流程，由 Go ``check`` 报失效。
+        旧引文是否还存在不影响刷新结果，源文件重命名也按"旧路径缺失"处理。
+    """
+    fixture_bytes, fixture, prefix, entries = prepare_refresh(options.baseline)
+    _refresh_existing_outputs(options, prefix)
+    return rebuild_corpus(fixture_bytes, fixture, prefix, entries, options.raw_dir, backend)
+
+
+def _refresh_existing_outputs(options: RefreshOptions, corpus_prefix: str) -> list[str]:
+    """校验输出目录，返回需要先移开的既有 refresh 快照条目。
+
+    Args:
+        options: 刷新选项。
+        corpus_prefix: 由旧 fixture 推导出的语料目录名。
+
+    Returns:
+        list[str]: 已存在且可以替换的条目名；没有则为空。
+
+    Raises:
+        InputError: 输出与基线重叠、条目类型异常，或已有快照但不是本工具的
+            refresh 产物、或未加 ``--force``。
+
+    Notes:
+        与导入侧的 ``_existing_outputs`` 规则一致：宁可拒绝也不覆盖来路不明
+        的目录内容。基线目录永远只读，连重叠都不允许。
+    """
+    baseline = options.baseline.resolve()
+    output = options.output.resolve()
+    if output == baseline or output.is_relative_to(baseline) or baseline.is_relative_to(output):
+        raise InputError("--output must not overlap --baseline; the old snapshot is read-only")
+
+    existing: list[str] = []
+    for name in (FIXTURE_NAME, REFRESH_SUMMARY_NAME, corpus_prefix):
+        path = options.output / name
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        is_link = stat.S_ISLNK(info.st_mode) or (
+            getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+        )
+        correct_type = stat.S_ISDIR(info.st_mode) if name == corpus_prefix else stat.S_ISREG(info.st_mode)
+        if is_link or not correct_type:
+            raise InputError(f"output entry is not a regular snapshot file or directory: {path}")
+        existing.append(name)
+    if not existing:
+        return existing
+    if not options.force:
+        raise InputError(
+            f"output already contains a snapshot ({existing[0]}); pass --force or pick a new directory"
+        )
+    if len(existing) != 3:
+        raise InputError("--force requires a complete prior refresh snapshot; use a new output directory")
+    try:
+        summary = json.loads((options.output / REFRESH_SUMMARY_NAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise InputError("--force requires a valid prior refresh summary") from exc
+    if not isinstance(summary, dict) or summary.get("tool") != TOOL or (
+        summary.get("mode") != REFRESH_MODE
+        or summary.get("schemaVersion") != SCHEMA_VERSION
+        or summary.get("status") != "ok"
+        or not isinstance(summary.get("outputs"), dict)
+        or summary["outputs"].get("corpus") != corpus_prefix
+    ):
+        raise InputError("--force requires an existing refresh snapshot with the same corpus prefix")
+    return existing
+
+
+def resolve_refresh_options(args: argparse.Namespace) -> RefreshOptions:
+    """把 ``refresh`` 子命令参数解析成绝对路径选项。
+
+    Args:
+        args: ``argparse`` 解析结果。
+
+    Returns:
+        RefreshOptions: 可直接使用的选项。
+
+    Raises:
+        InputError: 根目录/基线不是目录、原始语料缺失、输出重叠或类型非法。
+    """
+    root = Path(args.ragkit_root).expanduser().resolve()
+    if not root.is_dir():
+        raise InputError(f"--ragkit-root is not a directory: {root}")
+    if root.name == "src" and (root / "ragkit" / "__init__.py").is_file():
+        root = root.parent
+
+    baseline = Path(args.baseline).expanduser().resolve()
+    if not baseline.is_dir():
+        raise InputError(f"--baseline is not a directory: {baseline}")
+
+    raw_dir = Path(args.raw_dir).expanduser()
+    raw_dir = (root / raw_dir).resolve() if not raw_dir.is_absolute() else raw_dir.resolve()
+    if not raw_dir.is_dir():
+        raise InputError(f"raw corpus directory does not exist: {raw_dir}")
+
+    output = Path(args.output).expanduser().resolve()
+    if any(part.casefold() == ".git" for part in output.parts):
+        raise InputError("--output must not be inside a Git metadata directory")
+    if output.exists() and not output.is_dir():
+        raise InputError(f"--output is not a directory: {output}")
+    for protected in (root, raw_dir):
+        if output.is_relative_to(protected) or protected.is_relative_to(output):
+            raise InputError("--output must not overlap the RAGKit checkout or its raw corpus")
+    return RefreshOptions(
+        root=root,
+        baseline=baseline,
+        output=output,
+        raw_dir=raw_dir,
+        force=bool(args.force),
+    )
+
+
+def write_refresh_snapshot(options: RefreshOptions, result: RefreshResult) -> None:
+    """把刷新结果写入新快照目录。
+
+    Args:
+        options: 刷新选项。
+        result: 刷新结果。
+
+    Raises:
+        InputError: 输出目录已有快照且不满足替换条件。
+        OSError: 写入失败。
+
+    Notes:
+        fixture 用 ``bytes`` 原样写入，绝不重新序列化——这是"冻结"的核心承诺。
+    """
+    corpus_prefix = result.summary["outputs"]["corpus"]
+    _install_snapshot(
+        options.output,
+        corpus_prefix,
+        lambda: _refresh_existing_outputs(options, corpus_prefix),
+        result.corpus,
+        {
+            FIXTURE_NAME: result.fixture_bytes,
+            REFRESH_SUMMARY_NAME: _json_bytes(result.summary),
+        },
+    )
+
+
+def print_refresh_report(options: RefreshOptions, result: RefreshResult) -> None:
+    """把刷新结果打印到终端。
+
+    Args:
+        options: 刷新选项。
+        result: 刷新结果。
+
+    Notes:
+        缺失源文件是预期结果（交给 ``check`` 报 ``file_missing``），因此写
+        stdout 而不是 stderr；真正的失败会在写盘前抛错并以退出码 2 结束。
+    """
+    counts = result.summary["counts"]
+    frozen = result.summary["frozenFixture"]
+    print(f"{TOOL} {VERSION} (refresh)")
+    print(f"ragkit root:  {options.root}")
+    print(f"baseline:     {options.baseline}")
+    print(f"fixture:      {FIXTURE_NAME} (frozen, sha256 {frozen['sha256'][:12]}...)")
+    print(f"corpus:       {result.summary['outputs']['corpus']}/ "
+          f"({counts['rebuilt']} rebuilt, {counts['missing']} missing)")
+    for path in result.missing_paths:
+        print(f"  missing source: {path} (omitted; check will report file_missing)")
+    print(f"summary:      {REFRESH_SUMMARY_NAME}")
+    print("status:       ok")
+
+
+def _first_line(text: str) -> str:
+    """取第一行非空文本，用于把子进程错误压成一条消息。
+
+    Args:
+        text: 子进程的 stderr。
+
+    Returns:
+        str: 第一条非空内容；全空时返回 ``no details``。
+    """
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return "no details"
+
+
+def _git_env(repo: Path) -> dict[str, str]:
+    """构造隔离的 Git 环境，避免读写调用者的 Git 配置。
+
+    Args:
+        repo: 临时仓库目录。
+
+    Returns:
+        dict: 合并后的环境变量。
+
+    Notes:
+        全局配置指向 ``.git`` 下的不存在文件，加上 ``GIT_CONFIG_NOSYSTEM=1``，
+        调用者的 global/system 配置不会影响提交结果，也不会被我们写入。
+    """
+    return {
+        **{name: value for name, value in os.environ.items() if not name.upper().startswith("GIT_")},
+        "GIT_CONFIG_GLOBAL": str(repo / ".git" / "verify-gitconfig"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_AUTHOR_NAME": "ragkit-verify",
+        "GIT_AUTHOR_EMAIL": "ragkit-verify@example.invalid",
+        "GIT_COMMITTER_NAME": "ragkit-verify",
+        "GIT_COMMITTER_EMAIL": "ragkit-verify@example.invalid",
+    }
+
+
+def _run_git_bytes(
+    repo: Path, args: Sequence[str], env: dict[str, str], data: bytes | None = None,
+) -> bytes:
+    try:
+        done = subprocess.run(
+            ["git", *args], cwd=repo, input=data, capture_output=True, env=env,
+        )
+    except OSError as exc:
+        raise InputError(f"cannot run git: {exc}") from exc
+    if done.returncode != 0:
+        raise InputError(
+            f"git {args[0]} failed: {_first_line(done.stderr.decode('utf-8', 'replace'))}"
+        )
+    return done.stdout
+
+
+def _commit_snapshot(
+    repo: Path, message: str, files: Iterable[tuple[str, bytes]], env: dict[str, str],
+    fixture_blob: bytes,
+) -> str:
+    """Populate the scratch index from raw blobs, bypassing worktree filters."""
+    _run_git_bytes(repo, ["read-tree", "--empty"], env)
+    entries = [b"100644 " + fixture_blob + b"\t" + FIXTURE_NAME.encode() + b"\0"]
+    for path, body in files:
+        blob = _run_git_bytes(repo, ["hash-object", "-w", "--stdin"], env, body).strip()
+        entries.append(b"100644 " + blob + b"\t" + path.encode() + b"\0")
+    _run_git_bytes(repo, ["update-index", "-z", "--index-info"], env, b"".join(entries))
+    _run_git_bytes(repo, ["commit", "--allow-empty", "--no-gpg-sign", "-q", "-m", message], env)
+    return _run_git_bytes(repo, ["rev-parse", "HEAD"], env).decode("ascii").strip()
+
+
+def _baseline_files(baseline: Path, entries: Sequence[tuple[str, str]]) -> Iterator[tuple[str, bytes]]:
+    for _, repo_path in entries:
+        path = baseline.joinpath(*repo_path.split("/"))
+        if not _regular_source(path, baseline, repo_path):
+            continue
+        with path.open("rb") as stream:
+            body = stream.read(MAX_BLOB_BYTES + 1)
+        if len(body) > MAX_BLOB_BYTES:
+            raise InputError(f"cannot read baseline {repo_path}: blob exceeds {MAX_BLOB_BYTES} bytes")
+        yield repo_path, body
+
+
+def _assert_fixture_frozen(repo: Path, base: str, head: str, fixture_bytes: bytes, env: dict[str, str]) -> None:
+    """确认两个提交里的 fixture 与冻结字节完全一致。
+
+    Raises:
+        InputError: 任一提交的 fixture 与冻结字节不同（内部不变量被破坏）。
+    """
+    for sha in (base, head):
+        committed = _run_git_bytes(repo, ["show", f"{sha}:{FIXTURE_NAME}"], env)
+        if committed != fixture_bytes:
+            raise InputError(f"fixture bytes differ in commit {sha[:12]}; refusing to report")
+
+
+def _run_checker(checker: Path, repo: Path, base: str, head: str, env: dict[str, str]) -> tuple[int, dict]:
+    """调用 Go 检查器并解析 JSON 报告。
+
+    Args:
+        checker: 可执行文件路径。
+        repo: 临时仓库目录。
+        base: 基线提交 SHA。
+        head: PR 提交 SHA。
+
+    Returns:
+        tuple: ``(退出码, 报告)``，退出码只会是 0 或 1。
+
+    Raises:
+        InputError: 无法执行、退出码异常，或输出不是合法 JSON 报告。
+    """
+    command = [
+        str(checker),
+        "check",
+        "--repo",
+        str(repo),
+        "--base",
+        base,
+        "--head",
+        head,
+        "--format",
+        "json",
+    ]
+    try:
+        done = subprocess.run(
+            command,
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise InputError(f"cannot execute checker {checker}: {exc}") from exc
+    if done.returncode not in (EXIT_OK, EXIT_REVIEW):
+        raise InputError(f"checker exited {done.returncode}: {_first_line(done.stderr)}")
+    try:
+        payload = json.loads(done.stdout)
+    except json.JSONDecodeError as exc:
+        raise InputError(f"checker did not return a JSON report: {exc}") from exc
+    if (not isinstance(payload, dict) or payload.get("schemaVersion") != SCHEMA_VERSION
+            or payload.get("tool") != "rag-fixture-check" or payload.get("base") != base
+            or payload.get("head") != head or not isinstance(payload.get("cases"), list)):
+        raise InputError("checker report does not match the requested snapshot comparison")
+    return done.returncode, payload
+
+
+def _affected_cases(payload: dict) -> list[dict]:
+    """从检查器报告里挑出需要复核的题。
+
+    Args:
+        payload: Go 检查器的 JSON 报告。
+
+    Returns:
+        list[dict]: 每项包含 ``id``、``question``（可能为空）与 ``statuses``。
+
+    Notes:
+        ``intact`` 与 ``relocated`` 视为有效；其余状态都进列表。这里只做筛选，
+        不改写任何状态。
+    """
+    affected: list[dict] = []
+    for case in payload["cases"]:
+        if not isinstance(case, dict) or not isinstance(case.get("id"), str) or not isinstance(
+            case.get("evidence"), list
+        ):
+            raise InputError("checker report contains an invalid case")
+        statuses = []
+        for item in case["evidence"]:
+            status = item.get("status") if isinstance(item, dict) else None
+            if status not in ("intact", "relocated", "missing", "ambiguous",
+                              "context_changed", "file_missing", "unreadable"):
+                raise InputError("checker report contains an invalid evidence status")
+            statuses.append(status)
+        if any(status not in ("intact", "relocated") for status in statuses):
+            affected.append(
+                {
+                    "id": case.get("id"),
+                    "question": case.get("question", ""),
+                    "statuses": statuses,
+                }
+            )
+    return affected
+
+
+@contextlib.contextmanager
+def _temporary_repo() -> Iterator[Path]:
+    """创建并清理一次性 Git 仓库目录。
+
+    Yields:
+        Path: 仓库根目录（已存在、为空）。
+
+    Notes:
+        仓库建在系统临时目录，不会碰调用者的工作区；退出时尽力删除。
+    """
+    root = Path(tempfile.mkdtemp(prefix="ragkit-verify-"))
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def run_verify(options: VerifyOptions, backend: RagkitBackend) -> VerifyResult:
+    """用可信加载器校验 PR 原始语料对冻结 fixture 的影响。
+
+    Args:
+        options: 校验选项。
+        backend: 可信 RAGKit 加载器后端。
+
+    Returns:
+        VerifyResult: 完整报告、退出码与受影响题。
+
+    Raises:
+        InputError: 输入不可用、源文档读取失败、Git 或检查器执行失败。
+
+    Notes:
+        流程固定为：读冻结 fixture → 用 ``--raw-dir`` 重建语料 → 在临时仓库
+        提交基线快照与 PR 快照 → 断言两份 fixture 字节相同 → 调 Go ``check``。
+        整个过程中旧快照与源语料只读，调用者的 Git 工作区完全不参与。
+    """
+    fixture_bytes, fixture, prefix, entries = prepare_refresh(options.baseline)
+    refresh = rebuild_corpus(fixture_bytes, fixture, prefix, entries, options.raw_dir, backend)
+
+    with _temporary_repo() as repo:
+        env = _git_env(repo)
+        _run_git_bytes(repo, ["init", "-q", "-b", "main", "--template="], env)
+        fixture_blob = _run_git_bytes(repo, ["hash-object", "-w", "--stdin"], env, fixture_bytes).strip()
+        base = _commit_snapshot(repo, "baseline snapshot", _baseline_files(options.baseline, entries),
+                                env, fixture_blob)
+        head = _commit_snapshot(repo, "PR snapshot",
+                                ((path, body.encode("utf-8")) for path, body in refresh.corpus.items()),
+                                env, fixture_blob)
+        _assert_fixture_frozen(repo, base, head, fixture_bytes, env)
+        checker_code, payload = _run_checker(options.checker, repo, base, head, env)
+
+    affected = _affected_cases(payload)
+    expected_cases = [(case["id"], len(case["evidence"])) for case in fixture["cases"]]
+    reported_cases = [(case["id"], len(case["evidence"])) for case in payload["cases"]]
+    if reported_cases != expected_cases:
+        raise InputError("checker report does not cover the frozen fixture")
+    if bool(affected) != (checker_code == EXIT_REVIEW):
+        raise InputError("checker findings do not match its exit code")
+    anchors = sum(len(case["evidence"]) for case in fixture["cases"])
+    report = {
+        "schemaVersion": SCHEMA_VERSION,
+        "tool": TOOL,
+        "version": VERSION,
+        "mode": VERIFY_MODE,
+        "status": "ok" if checker_code == EXIT_OK else "review",
+        "checkerExitCode": checker_code,
+        "frozenFixture": {
+            "path": FIXTURE_NAME,
+            "sha256": hashlib.sha256(fixture_bytes).hexdigest(),
+            "bytesIdenticalAcrossCommits": True,
+            "cases": len(fixture["cases"]),
+            "anchors": anchors,
+        },
+        "corpus": {
+            "rebuilt": len(refresh.corpus),
+            "missing": len(refresh.missing_paths),
+            "missingPaths": refresh.missing_paths,
+        },
+        "commits": {"base": base, "head": head},
+        "checker": {"binary": options.checker.name},
+        "affected": affected,
+        "check": payload,
+    }
+    return VerifyResult(
+        report=report,
+        exit_code=EXIT_OK if checker_code == EXIT_OK else EXIT_REVIEW,
+        affected=affected,
+    )
+
+
+def resolve_verify_options(args: argparse.Namespace) -> VerifyOptions:
+    """把 ``verify`` 子命令参数解析成绝对路径选项。
+
+    Args:
+        args: ``argparse`` 解析结果。
+
+    Returns:
+        VerifyOptions: 可直接使用的选项。
+
+    Raises:
+        InputError: 目录缺失、检查器不是文件、报告路径非法或落在旧快照内。
+    """
+    root = Path(args.ragkit_root).expanduser().resolve()
+    if not root.is_dir():
+        raise InputError(f"--ragkit-root is not a directory: {root}")
+    if root.name == "src" and (root / "ragkit" / "__init__.py").is_file():
+        root = root.parent
+
+    baseline = Path(args.baseline).expanduser().resolve()
+    if not baseline.is_dir():
+        raise InputError(f"--baseline is not a directory: {baseline}")
+
+    raw_dir = Path(args.raw_dir).expanduser()
+    raw_dir = (root / raw_dir).resolve() if not raw_dir.is_absolute() else raw_dir.resolve()
+    if not raw_dir.is_dir():
+        raise InputError(f"--raw-dir is not a directory: {raw_dir}")
+
+    checker = Path(args.checker).expanduser().resolve()
+    if not checker.is_file():
+        raise InputError(f"--checker is not a file: {checker}")
+
+    report = Path(args.report).expanduser().resolve()
+    if report.exists() and report.is_dir():
+        raise InputError(f"--report is a directory: {report}")
+    if report.is_relative_to(baseline):
+        raise InputError("--report must not be written inside the baseline snapshot")
+    if report.is_relative_to(root) or report.is_relative_to(raw_dir) or report == checker:
+        raise InputError("--report must be outside the loader checkout, PR corpus and checker file")
+    if any(part.casefold() == ".git" for part in report.parts):
+        raise InputError("--report must not be written inside Git metadata")
+    return VerifyOptions(
+        root=root,
+        baseline=baseline,
+        raw_dir=raw_dir,
+        checker=checker,
+        report=report,
+    )
+
+
+def write_verify_report(path: Path, report: dict) -> None:
+    """写出完整 JSON 报告，父目录按需创建。
+
+    Args:
+        path: 报告路径。
+        report: 报告内容。
+
+    Raises:
+        OSError: 创建目录或写入失败。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".verify-report-", delete=False) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(_json_bytes(report))
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def print_verify_report(options: VerifyOptions, result: VerifyResult) -> None:
+    """把校验结果打印到终端。
+
+    Args:
+        options: 校验选项。
+        result: 校验结果。
+
+    Notes:
+        终端只打印摘要与受影响题号；完整细节在 ``--report`` 里。退出码 1 时
+        报告已经写好，打印只是提示。
+    """
+    frozen = result.report["frozenFixture"]
+    corpus = result.report["corpus"]
+    print(f"{TOOL} {VERSION} (verify)")
+    print(f"baseline:     {options.baseline}")
+    print(f"raw dir:      {options.raw_dir}")
+    print(f"report:       {options.report}")
+    print(f"fixture:      {FIXTURE_NAME} (frozen, sha256 {frozen['sha256'][:12]}...)")
+    print(f"corpus:       {corpus['rebuilt']} rebuilt, {corpus['missing']} missing")
+    if result.affected:
+        print("affected:")
+        for case in result.affected:
+            print(f"  {case['id']}: {', '.join(case['statuses'])}")
+        print(f"status: review needed (exit {EXIT_REVIEW})")
+    else:
+        print(f"status: ok (exit {EXIT_OK})")
+
+
+def build_verify_parser() -> argparse.ArgumentParser:
+    """构造 ``verify`` 子命令的解析器。
+
+    Returns:
+        argparse.ArgumentParser: 解析器实例。
+
+    Notes:
+        五个参数都是必需的：可信加载器、旧快照、PR 原始语料、检查器、报告路径。
+        ``--raw-dir`` 没有默认值，避免误把本仓库的语料当成 PR 语料。
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{TOOL} verify",
+        description=(
+            "Check whether a docs PR invalidates committed evaluation evidence. "
+            "The frozen fixture comes from --baseline, the text from --raw-dir, "
+            "and the comparison runs in a throwaway Git repository."
+        ),
+    )
+    parser.add_argument("--ragkit-root", required=True, help="trusted RAGKit loader project (read-only)")
+    parser.add_argument("--baseline", required=True, help="snapshot holding the frozen fixture (read-only)")
+    parser.add_argument("--raw-dir", required=True, help="raw corpus of the PR (absolute or root-relative)")
+    parser.add_argument("--checker", required=True, help="rag-fixture-check executable")
+    parser.add_argument("--report", required=True, help="path of the complete JSON report")
+    parser.add_argument("--version", action="version", version=f"{TOOL} {VERSION}")
+    return parser
+
+
+def _verify_cli(argv: Sequence[str], backend: RagkitBackend | None) -> int:
+    """执行 ``verify`` 子命令。
+
+    Args:
+        argv: ``verify`` 之后的参数。
+        backend: 仅用于测试注入。
+
+    Returns:
+        int: 0 全部有效、1 有证据需要复核、2 输入/读取/执行失败。
+
+    Notes:
+        退出 1 之前一定先写报告；写报告失败按退出 2 处理，避免"任务失败但
+        没有证据"的中间状态。
+    """
+    args = build_verify_parser().parse_args(argv)
+    try:
+        options = resolve_verify_options(args)
+        if backend is None:
+            backend = load_ragkit_backend(options.root)
+        result = run_verify(options, backend)
+    except (InputError, OSError, UnicodeError, RuntimeError) as exc:
+        print(f"{TOOL}: error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    try:
+        write_verify_report(options.report, result.report)
+    except OSError as exc:
+        print(f"{TOOL}: error: cannot write report {options.report}: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    print_verify_report(options, result)
+    return result.exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。
 
@@ -1210,11 +2304,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     Notes:
         必需参数只有 ``--ragkit-root`` 与 ``--output``；其余路径可覆盖，用于
-        布局不同的 RAGKit 分支。
+        布局不同的 RAGKit 分支。``refresh`` 是独立子命令，见
+        :func:`build_refresh_parser`；不写子命令时保持 v0.2 的导入行为。
     """
     parser = argparse.ArgumentParser(
         prog=TOOL,
         description="Export a RAGKit evaluation set as a rag-fixture-check snapshot.",
+        epilog=(
+            "Subcommands:\n"
+            "  refresh   rebuild the normalized corpus for a frozen fixture\n"
+            "  verify    check a docs PR against a frozen fixture with a checker\n"
+            "            run '" + TOOL + " <command> --help' for their flags"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--ragkit-root", required=True, help="RAGKit project root (or its src directory)")
     parser.add_argument("--output", required=True, help="directory that receives the snapshot")
@@ -1227,18 +2329,41 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None, *, backend: RagkitBackend | None = None) -> int:
-    """CLI 入口。
+def build_refresh_parser() -> argparse.ArgumentParser:
+    """构造 ``refresh`` 子命令的解析器。
+
+    Returns:
+        argparse.ArgumentParser: 解析器实例。
+
+    Notes:
+        必需参数是 ``--ragkit-root``、``--baseline`` 与 ``--output``；没有
+        ``--corpus-prefix``，因为前缀由冻结 fixture 决定。
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{TOOL} refresh",
+        description=(
+            "Rebuild the normalized corpus for a frozen fixture without changing the fixture. "
+            "Quotes that no longer exist are left alone for the checker to report."
+        ),
+    )
+    parser.add_argument("--ragkit-root", required=True, help="RAGKit project root (or its src directory)")
+    parser.add_argument("--baseline", required=True, help="previous snapshot directory (read-only)")
+    parser.add_argument("--output", required=True, help="new snapshot directory")
+    parser.add_argument("--raw-dir", default=str(DEFAULT_RAW_DIR), help="raw corpus directory, relative to the root")
+    parser.add_argument("--force", action="store_true", help="replace an existing refresh snapshot in the output directory")
+    parser.add_argument("--version", action="version", version=f"{TOOL} {VERSION}")
+    return parser
+
+
+def _import_cli(argv: Sequence[str] | None, backend: RagkitBackend | None) -> int:
+    """执行 v0.2 的导入流程。
 
     Args:
-        argv: 不含程序名的参数列表；``None`` 表示取 ``sys.argv[1:]``。
-        backend: 仅用于测试注入；生产调用应省略，由 ``--ragkit-root`` 加载。
+        argv: 导入参数（不含 ``import`` 前缀）。
+        backend: 仅用于测试注入。
 
     Returns:
         int: 0 成功、1 有导入问题、2 输入或环境错误。
-
-    Notes:
-        ``argparse`` 自身在参数错误时会以 2 退出，与本文档的退出码约定一致。
     """
     args = build_parser().parse_args(argv)
     try:
@@ -1262,6 +2387,64 @@ def main(argv: Sequence[str] | None = None, *, backend: RagkitBackend | None = N
 
     print_report(options, result)
     return EXIT_OK
+
+
+def _refresh_cli(argv: Sequence[str], backend: RagkitBackend | None) -> int:
+    """执行 ``refresh`` 子命令。
+
+    Args:
+        argv: ``refresh`` 之后的参数。
+        backend: 仅用于测试注入。
+
+    Returns:
+        int: 0 刷新成功（包含源文件缺失的情况）、2 输入或环境错误。
+
+    Notes:
+        refresh 没有"需审阅"这个退出码：旧引文是否失效由 Go ``check`` 判定，
+        本命令只负责把新语料准备好。
+    """
+    args = build_refresh_parser().parse_args(argv)
+    try:
+        options = resolve_refresh_options(args)
+        if backend is None:
+            backend = load_ragkit_backend(options.root)
+        result = run_refresh(options, backend)
+    except (InputError, OSError, UnicodeError, RuntimeError) as exc:
+        print(f"{TOOL}: error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    try:
+        write_refresh_snapshot(options, result)
+    except (InputError, OSError, UnicodeError) as exc:
+        print(f"{TOOL}: error: cannot write output: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+    print_refresh_report(options, result)
+    return EXIT_OK
+
+
+def main(argv: Sequence[str] | None = None, *, backend: RagkitBackend | None = None) -> int:
+    """CLI 入口，负责在 ``import``（默认）与 ``refresh`` 之间分派。
+
+    Args:
+        argv: 不含程序名的参数列表；``None`` 表示取 ``sys.argv[1:]``。
+        backend: 仅用于测试注入；生产调用应省略，由 ``--ragkit-root`` 加载。
+
+    Returns:
+        int: 导入与 verify 返回 0/1/2；refresh 返回 0/2。
+
+    Notes:
+        不写子命令时按 v0.2 的导入命令处理，``import`` 也可以显式写出。
+        ``argparse`` 自身在参数错误时会以 2 退出，与退出码约定一致。
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == REFRESH_MODE:
+        return _refresh_cli(args[1:], backend)
+    if args and args[0] == VERIFY_MODE:
+        return _verify_cli(args[1:], backend)
+    if args and args[0] == "import":
+        args = args[1:]
+    return _import_cli(args, backend)
 
 
 if __name__ == "__main__":

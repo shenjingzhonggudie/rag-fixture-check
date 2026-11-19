@@ -1,0 +1,131 @@
+# Copy this file to .github/workflows/verify-ragkit-evidence.yml in the repository
+# that holds the RAGKit docs, the trusted loader, and the committed snapshot.
+#
+# Two repository variables (Settings -> Secrets and variables -> Actions ->
+# Variables) configure it; both can also be edited directly in this file:
+#   RAG_FIXTURE_CHECK_REF   required, full 40-character commit SHA of a reviewed
+#                           tool commit containing the verify command
+#   RAG_FIXTURE_CHECK_REPO  optional, defaults to shenjingzhonggudie/rag-fixture-check
+# Commit the baseline as rag-snapshot/ on the base branch.
+#
+# What it does: the frozen fixture and the loader come from the trusted base
+# commit; the PR checkout is read only for its raw Markdown. The PR's own Python
+# files and scripts are never imported or executed.
+name: verify-ragkit-evidence
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      # Repository variables win; the literal fallbacks keep a copied file working.
+      RAG_FIXTURE_CHECK_REPO: ${{ vars.RAG_FIXTURE_CHECK_REPO || 'shenjingzhonggudie/rag-fixture-check' }}
+      RAG_FIXTURE_CHECK_REF: ${{ vars.RAG_FIXTURE_CHECK_REF }}
+    steps:
+      - name: Require a pinned checker revision
+        run: |
+          if [[ ! "${RAG_FIXTURE_CHECK_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Set RAG_FIXTURE_CHECK_REF to a reviewed checker commit (full 40-character SHA) containing verify."
+            exit 2
+          fi
+          if [[ ! "${RAG_FIXTURE_CHECK_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Set RAG_FIXTURE_CHECK_REPO to 'owner/name'."
+            exit 2
+          fi
+
+      # 1. The PR side: raw documents only. Nothing from this checkout is executed.
+      - name: Checkout the PR raw documents
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 1
+          persist-credentials: false
+
+      # 2. The trusted side: loader code, qrels, and the committed baseline snapshot.
+      - name: Checkout the trusted base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          fetch-depth: 1
+          persist-credentials: false
+
+      # 3. The tool itself, from the configured repository at a reviewed commit.
+      - name: Checkout the pinned tool
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RAG_FIXTURE_CHECK_REPO }}
+          ref: ${{ env.RAG_FIXTURE_CHECK_REF }}
+          path: tool
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Build the checker from the pinned commit
+        working-directory: tool
+        run: go build -trimpath -o "$RUNNER_TEMP/rag-fixture-check" .
+
+      # The loader's dependencies come from the trusted base commit, never from
+      # the PR. Skip this step when the loader is stdlib-only.
+      - name: Install the trusted loader
+        run: |
+          if [ -f trusted/pyproject.toml ]; then
+            python -m pip install --disable-pip-version-check ./trusted
+          fi
+
+      # Raw corpus availability:
+      # - If data/raw IS tracked in this repository, the PR checkout already has it.
+      # - If it is NOT tracked, add a trusted materialization step here. Fetch the
+      #   PR/head corpus revision from a pinned artifact, digest, or corpus commit
+      #   and set RAW_DIR to its absolute path via GITHUB_ENV.
+      - name: Resolve the PR raw corpus
+        run: |
+          default_raw="$GITHUB_WORKSPACE/pr/data/raw"
+          raw="${RAW_DIR:-$default_raw}"
+          if [[ "$raw" != /* || ! -d "$raw" ]]; then
+            echo "::error::Set RAW_DIR to an absolute directory with the pinned head corpus, or track pr/data/raw."
+            exit 2
+          fi
+          if [[ "$raw" == "$default_raw" && "$(realpath -- "$raw")" != "$(realpath -- "$GITHUB_WORKSPACE/pr")/data/raw" ]]; then
+            echo "::error::The tracked raw corpus must be a directory inside the PR checkout."
+            exit 2
+          fi
+          if [[ ! -f "$GITHUB_WORKSPACE/trusted/rag-snapshot/.rag-fixtures.json" ]]; then
+            echo "::error::Commit the frozen baseline snapshot under rag-snapshot/ on the base branch."
+            exit 2
+          fi
+          printf 'RAW_DIR=%s\n' "$raw" >> "$GITHUB_ENV"
+
+      # Exit 0 = every anchor still resolves. Exit 1 = evidence needs review
+      # (the step fails). Exit 2 = setup/read/exec failure.
+      - name: Verify evidence anchors
+        run: |
+          python -I -B tool/tools/ragkit_import.py verify \
+            --ragkit-root trusted \
+            --baseline trusted/rag-snapshot \
+            --raw-dir "$RAW_DIR" \
+            --checker "$RUNNER_TEMP/rag-fixture-check" \
+            --report "$RUNNER_TEMP/verify-report.json"
+
+      # Keep the full JSON report even when verification fails.
+      - name: Upload the JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report
+          path: ${{ runner.temp }}/verify-report.json
+          if-no-files-found: ignore

@@ -2,7 +2,7 @@
 
 **Know which RAG evaluation cases your docs PR just broke — before it merges.**
 
-[中文文档](README.zh-CN.md) · [Download v0.2.0](https://github.com/shenjingzhonggudie/rag-fixture-check/releases/tag/v0.2.0) · [CI workflow](examples/workflows/rag-fixture-check.yml)
+[中文文档](README.zh-CN.md) · [Download v0.3.0](https://github.com/shenjingzhonggudie/rag-fixture-check/releases/tag/v0.3.0) · [CI workflow](examples/workflows/rag-fixture-check.yml)
 
 `rag-fixture-check` is a single-binary Go CLI that resolves every evidence anchor in your RAG fixture against the committed tree of a pull request. It tells you exactly which quotes disappeared, which ones moved, which ones became ambiguous, and which `prefix`/`suffix` selectors no longer match.
 
@@ -71,7 +71,7 @@ The demo builds a temporary repository with two commits, breaks a refund window,
 To try real annotated evidence, run the [QASPER smoke test](examples/qasper/README.md). It retrieves six human-annotated evidence paragraphs and compares them across two Git commits with controlled edits.
 
 ```text
-rag-fixture-check 0.2.0
+rag-fixture-check 0.3.0
 repo:     /tmp/rag-fixture-demo-1234567
 base:     4a1c0f0...
 head:     9b7e2d1...
@@ -145,7 +145,7 @@ go build -trimpath -o rag-fixture-check .
 
 Requirements at runtime: a `git` executable in `PATH`. Nothing else — no Python, no embeddings, no network access.
 
-Pin a version in CI with `go install ...@v0.2.0` or a checksummed release asset.
+Pin a version in CI with `go install ...@v0.3.0` or a checksummed release asset.
 
 ## CLI
 
@@ -262,7 +262,7 @@ Stable, versioned (`schemaVersion: 1`), deterministic: the same input produces b
 {
   "schemaVersion": 1,
   "tool": "rag-fixture-check",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "repo": "/repo",
   "base": "4a1c0f0...",
   "head": "9b7e2d1...",
@@ -408,7 +408,7 @@ RAGKit records quotes and offsets against `normalize_text(load_file(path).text)`
 
 - Python 3.11+ for the importer only; the Go CLI stays dependency-free
 - A RAGKit checkout containing `data/eval/qrels.json`, `data/raw/` and, optionally, `data/eval/annotation_manifest.json`
-- The importer script from the [v0.2.0 source tree](https://github.com/shenjingzhonggudie/rag-fixture-check/tree/v0.2.0). It is also available in the [source archive](https://github.com/shenjingzhonggudie/rag-fixture-check/archive/refs/tags/v0.2.0.zip) if you installed only the checker binary.
+- The importer script from the [v0.3.0 source tree](https://github.com/shenjingzhonggudie/rag-fixture-check/tree/v0.3.0). It is also available in the [source archive](https://github.com/shenjingzhonggudie/rag-fixture-check/archive/refs/tags/v0.3.0.zip) if you installed only the checker binary.
 
 ### Import
 
@@ -452,15 +452,105 @@ The output contains full normalized versions of referenced documents, plus the q
 
 Exit `0` writes the snapshot. Exit `1` reports an invalid case, anchor or normalized document on stderr before writing. Exit `2` covers setup, qrels hash, manifest format, output conflict or filesystem errors.
 
-### Commit a snapshot and compare two versions
+### Refresh after the source documents change
 
-In this Bash example, `rag-fixture-check` is already on PATH. The second commit simulates a change to the normalized snapshot. For a full re-import after changing the raw corpus, refresh the RAGKit annotations and manifest first.
+Documentation edits can invalidate old quotes or the annotation manifest. Use `refresh` to copy the baseline fixture byte for byte and rebuild the normalized corpus for comparison.
 
 ```bash
-# 1. Put the snapshot in a throwaway repository.
-mkdir /tmp/ragkit-repro && cd /tmp/ragkit-repro
-git init -b main
-cp -r /tmp/ragkit-snapshot/.rag-fixtures.json /tmp/ragkit-snapshot/corpus .
+python tools/ragkit_import.py refresh \
+  --ragkit-root /path/to/ragkit \
+  --baseline /tmp/ragkit-snapshot \
+  --output /tmp/ragkit-snapshot-v2
+```
+
+| Behaviour | Result |
+| --- | --- |
+| fixture | copied byte for byte; ids, quotes and selectors never change |
+| quote no longer present in the source | refresh exits 0; `check` reports `missing` |
+| source file deleted | the file is omitted from the new snapshot; `check` reports `file_missing` |
+| source file renamed | treated as "the old path went missing" in this round |
+| permission, decode, path or write failure | exit 2 naming the offending path; never reported as a deletion |
+| annotation manifest | not verified — it describes the old corpus |
+| output directory | use a separate directory; `--force` can replace a complete prior refresh with the same corpus prefix |
+
+`refresh-summary.json` records `counts.rebuilt`, `missingPaths` and the frozen fixture's SHA-256:
+
+```json
+{
+  "mode": "refresh",
+  "frozenFixture": { "path": ".rag-fixtures.json", "sha256": "…", "cases": 3, "anchors": 3 },
+  "counts": { "cases": 3, "anchors": 3, "documents": 3, "rebuilt": 2, "missing": 1 },
+  "missingPaths": ["corpus/docs/autoscaling.md"]
+}
+```
+
+### Verify a PR without writing a new snapshot
+
+`verify` runs the whole loop in one command: read the frozen fixture, rebuild the corpus from a PR's raw documents with the trusted loader, commit both snapshots into a throwaway Git repository, then run `check` there.
+
+```bash
+python tools/ragkit_import.py verify \
+  --ragkit-root /path/to/trusted-ragkit \
+  --baseline /tmp/ragkit-snapshot \
+  --raw-dir /path/to/pr/data/raw \
+  --checker /usr/local/bin/rag-fixture-check \
+  --report verify-report.json
+```
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | every anchor still resolves; the report is written |
+| `1` | at least one anchor needs review; the report is written before exiting |
+| `2` | input, read, Git, checker or report-write failure; any previous report is left in place |
+
+The terminal prints the summary and the affected case ids. The JSON report adds provenance to the complete checker output:
+
+```json
+{
+  "mode": "verify",
+  "status": "review",
+  "checkerExitCode": 1,
+  "frozenFixture": { "sha256": "…", "bytesIdenticalAcrossCommits": true, "cases": 3, "anchors": 3 },
+  "corpus": { "rebuilt": 2, "missing": 1, "missingPaths": ["corpus/docs/autoscaling.md"] },
+  "commits": { "base": "…", "head": "…" },
+  "affected": [{ "id": "refund-30", "question": "How many days?", "statuses": ["missing"] }],
+  "check": { "…": "the complete rag-fixture-check JSON report" }
+}
+```
+
+Properties worth relying on:
+
+- the fixture is copied byte for byte, and both commits must contain the same bytes — verify refuses to report otherwise;
+- the baseline snapshot, the loader checkout and the PR raw corpus are only read;
+- the comparison happens in a temporary repository under the system temp directory. The `commits` fields are its snapshot SHAs. The caller's Git worktree and configuration are untouched;
+- an unreadable source (permissions, decoding, a directory at the path) exits 2 and never degrades to `file_missing`;
+- identical snapshots still produce two commits and exit 0;
+- renames are still treated as "the old path went missing" in this round.
+
+To use the [GitHub Actions example](examples/workflows/verify-ragkit-evidence.yml):
+
+1. Commit the baseline fixture and normalized corpus under `rag-snapshot/` on the base branch, the trusted loader under `src/ragkit/`, and the documents under `data/raw/`.
+2. Set two repository variables (Settings → Secrets and variables → Actions → Variables), or edit the `env:` block of the copied file:
+   - `RAG_FIXTURE_CHECK_REF` (required): a reviewed tool commit containing `verify`, as a **full 40-character SHA**. Tags, branches and short SHAs are rejected before any checkout. This is what makes the comparison reproducible and independent of what the PR ships.
+   - `RAG_FIXTURE_CHECK_REPO` (optional): `owner/name` of the tool repository. Defaults to `shenjingzhonggudie/rag-fixture-check`, which is useful for forks, mirrors and pre-release acceptance.
+3. Use tracked `data/raw` from the PR head, or configure a trusted step to materialize the reviewed head corpus from a pinned artifact, digest, or corpus commit. Set `RAW_DIR` to its absolute path via `GITHUB_ENV`. A plain checkout supplies only tracked data.
+4. Review the uploaded JSON when the check fails. It contains baseline question text and evidence paths. Run the job where that data can be shared. Make the job a required check if it should block merges.
+
+The example loads Python from the base checkout and gives the PR checkout only the raw corpus role. Review changes to the workflow itself as code. [GitHub Actions pull request events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)
+
+### Commit a snapshot and compare two versions
+
+The full loop: import a baseline, edit the original Markdown, refresh, commit the second snapshot, then let `check` compare the two commits. In this Bash example `rag-fixture-check` is on PATH. Choose a real source file referenced by your fixture for the edit.
+
+```bash
+# 1. Build the baseline snapshot and commit it.
+scratch="$(mktemp -d)"
+importer="$PWD/tools/ragkit_import.py"
+ragkit=/path/to/ragkit
+python "$importer" --ragkit-root "$ragkit" --output "$scratch/baseline" || exit
+
+cd "$scratch/baseline" || exit
+git init -b main || exit
 git add .rag-fixtures.json corpus
 git -c user.name=Demo -c user.email=demo@example.invalid commit -m "RAGKit snapshot"
 
@@ -468,28 +558,48 @@ git -c user.name=Demo -c user.email=demo@example.invalid commit -m "RAGKit snaps
 rag-fixture-check check --repo . --base HEAD --head HEAD
 # exit 0, intact = number of anchors
 
-# 3. Simulate a documentation edit that invalidates the first quoted evidence.
-python - <<'PY'
-import json
-from pathlib import Path
+# 3. Edit the ORIGINAL Markdown inside the RAGKit checkout.
+# Example path. Replace it with a document from your own fixture.
+"${EDITOR:-vi}" "$ragkit/data/raw/docs/refund.md"
 
-fixture = json.loads(Path(".rag-fixtures.json").read_text(encoding="utf-8"))
-anchor = fixture["cases"][0]["evidence"][0]
-path = Path(anchor["path"])
-# Replace every occurrence so the case is affected even when the quote repeats.
-path.write_text(path.read_text(encoding="utf-8").replace(anchor["exact"], "Evidence was rewritten."),
-                encoding="utf-8", newline="\n")
-PY
-git -c user.name=Demo -c user.email=demo@example.invalid commit -am "rewrite one piece of evidence"
+# 4. Rebuild only the corpus; the fixture stays frozen.
+python "$importer" refresh \
+  --ragkit-root "$ragkit" \
+  --baseline "$scratch/baseline" \
+  --output "$scratch/refreshed" || exit
 
-# 4. Compare the two snapshots.
+# 5. Commit the refreshed snapshot as the second version.
+git rm -r -- corpus || exit
+cp -r "$scratch/refreshed/corpus" . || exit
+cp "$scratch/refreshed/refresh-summary.json" . || exit
+git add -A -- corpus refresh-summary.json
+git -c user.name=Demo -c user.email=demo@example.invalid commit -m "refresh after the docs change"
+
+# 6. Compare the two versions.
 rag-fixture-check check --repo . --base HEAD~1 --head HEAD
-# exit 1: the selected evidence is missing; cases that share it can also be flagged
+# Exit 1 if any anchors need review.
+```
+
+A typical result after one rewritten page and one deleted page:
+
+```text
+CASE refund-30
+  [missing]         corpus/docs/refund.md (last seen at line 431)  matches=0 selected=0  quote not found in file
+
+CASE autoscaling
+  [file_missing]    corpus/docs/autoscaling.md (last seen at line 58)  matches=0 selected=0  path is not present in the head commit
+
+SUMMARY
+  cases=3 evidence=3
+  intact=1 relocated=0 missing=1 ambiguous=0 context_changed=0 file_missing=1 unreadable=0
+VERDICT: review needed (2 anchor(s) are not intact)
 ```
 
 `check` reads committed trees only, so the worktree state is irrelevant. Add `--format github` for PR annotations, or `--format json` to archive the report.
 
-**Acceptance numbers.** The pilot run against the reference RAGKit corpus imported 246 cases and 589 evidence anchors, and the baseline check of that snapshot was fully intact. Those numbers describe that corpus; nothing in the importer is tuned to them or hard-codes them.
+For a source PR, pass `--raw-dir /path/to/pr-checkout/data/raw` and point `--ragkit-root` at the trusted checkout with the loader used to create the baseline. The bundled workflow checks committed fixtures and documents. For generated snapshots, use a text or JSON report to review the generated `corpus/` paths.
+
+**Acceptance numbers.** The pilot run against the reference RAGKit corpus imported 246 cases and 589 evidence anchors, and its baseline check was fully intact (589/589). After rewriting one source page and deleting another, `refresh` rebuilt 78 documents, omitted the deleted one, kept the fixture byte-identical across both commits, and `check` exited 1 with 586 intact, 1 `missing` and 2 `file_missing`. Those numbers describe that corpus; nothing in the importer is tuned to them or hard-codes them.
 
 ## What the test suite covers
 
@@ -529,11 +639,33 @@ The Python importer has its own synthetic-data suite — no RAGKit installation 
 - a fake `ragkit` package under `<root>/src` proving `load_file` and `normalize_text` are really imported from `--ragkit-root`
 - byte-identical fixture and summary across runs
 
+`refresh` adds its own synthetic-data suite, including a real-Git end-to-end run:
+
+- fixture copied byte for byte; ids, quotes and selectors unchanged
+- rewritten quote still refreshes, and the rebuilt corpus shows the new text
+- deleted source omitted from the new snapshot and listed in `missingPaths`
+- renamed source treated as a missing old path
+- decode failure and a directory at the source path → exit 2, nothing written
+- output equal to or inside the baseline → refused; `--force` only replaces a prior refresh snapshot
+- custom `--corpus-prefix` preserved; the annotation manifest deliberately not verified
+- end-to-end: commit the baseline snapshot, refresh after rewriting one page and deleting another, commit again, then assert the fixture is byte-identical across commits and that `check` exits 0 without changes and 1 with the expected case ids
+
 ```bash
 go test ./...
 python -m unittest discover -s tools/tests
 go run ./examples/demo
 ```
+
+`verify` is covered end to end as well:
+
+- unchanged documents → exit 0, empty `affected`, two commits with identical fixture bytes
+- rewrite the original Markdown → exit 1, correct case id with `missing`, full report on disk
+- delete a source file → exit 1, `file_missing` plus `corpus.missingPaths`
+- unreadable source → exit 2, no report written
+- missing checker or raw directory, and a report path inside the baseline → exit 2
+- the baseline snapshot is byte-identical before and after a failing verify
+
+The end-to-end cases need a `rag-fixture-check` binary: they use `RAG_FIXTURE_CHECK_BIN`, then `rag-fixture-check` on `PATH`, then `go build`. Without any of them those cases skip with an explicit reason.
 
 ## Boundaries and non-goals
 
@@ -578,8 +710,8 @@ internal/gitx/              safe read-only git wrapper
 internal/match/             literal + selector matching
 internal/check/             orchestration, baseline comparison, summary
 internal/report/            text / json / github rendering
-tools/ragkit_import.py      RAGKit evaluation set → fixture + normalized snapshot
-tools/tests/                synthetic-data tests for the importer
+tools/ragkit_import.py      RAGKit evaluation set → fixture + normalized snapshot (import / refresh)
+tools/tests/                synthetic-data tests for the importer and the refresher
 examples/demo/              end-to-end demo on a throwaway repo
 examples/workflows/         copy-paste PR workflow
 schema/                     JSON Schema for fixtures and reports

@@ -19,8 +19,8 @@ import (
 // ToolName 是命令名，出现在所有面向用户的文本里。
 const ToolName = "rag-fixture-check"
 
-// Version 是发布版本号；与 v0.2 的 Python 导入器保持同一条版本线。
-const Version = "0.2.0"
+// Version 是发布版本号；与 tools/ragkit_import.py 保持同一条版本线。
+const Version = "0.3.0"
 
 // 退出码契约。
 const (

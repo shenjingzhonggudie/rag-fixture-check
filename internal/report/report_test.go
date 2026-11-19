@@ -65,11 +65,11 @@ func sampleResult() *check.Result {
 func TestTextRendersStatuses(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	if err := Text(&buf, sampleResult(), "0.2.0"); err != nil {
+	if err := Text(&buf, sampleResult(), "0.3.0"); err != nil {
 		t.Fatalf("Text: %v", err)
 	}
 	out := buf.String()
-	for _, want := range []string{"rag-fixture-check 0.2.0", "CASE refund-30  (modified)", "[missing]", "[relocated]", "[ambiguous]", "was line 3", "VERDICT: review needed (2 anchor(s) are not intact)", "NOTE:"} {
+	for _, want := range []string{"rag-fixture-check 0.3.0", "CASE refund-30  (modified)", "[missing]", "[relocated]", "[ambiguous]", "was line 3", "VERDICT: review needed (2 anchor(s) are not intact)", "NOTE:"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("text output missing %q:\n%s", want, out)
 		}
@@ -79,10 +79,10 @@ func TestTextRendersStatuses(t *testing.T) {
 func TestJSONIsStableAndVersioned(t *testing.T) {
 	t.Parallel()
 	var first, second bytes.Buffer
-	if err := JSON(&first, sampleResult(), "0.2.0"); err != nil {
+	if err := JSON(&first, sampleResult(), "0.3.0"); err != nil {
 		t.Fatalf("JSON: %v", err)
 	}
-	if err := JSON(&second, sampleResult(), "0.2.0"); err != nil {
+	if err := JSON(&second, sampleResult(), "0.3.0"); err != nil {
 		t.Fatalf("JSON: %v", err)
 	}
 	if first.String() != second.String() {
