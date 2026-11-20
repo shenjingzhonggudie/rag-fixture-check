@@ -22,14 +22,24 @@
             --baseline <old-snapshot> --raw-dir <pr-raw-docs> \
             --checker <rag-fixture-check> --report <report.json>
 
+    从 v0.4 起也可以用内置的明文加载器，不需要 RAGKit 或加载器适配层：
+
+        python tools/ragkit_import.py verify --loader plain-text \
+            --baseline <old-snapshot> --raw-dir <pr-raw-docs> \
+            --checker <rag-fixture-check> --report <report.json>
+
+    ``--loader plain-text`` 只做三件事：严格按 UTF-8 解码（去掉开头一个 BOM）、
+    把 ``\\r\\n``/``\\r`` 归一成 ``\\n``、其余原样保留；baseline 与 head 必须
+    使用同一套规则。
+
 职责边界
 --------
 - 只读 RAGKit 项目（qrels、annotation manifest、``data/raw`` 语料）、旧快照
   与 PR 原始语料；
 - ``import``/``refresh`` 只写 ``--output`` 目录；``verify`` 只写 ``--report``，
   快照与 Git 操作全部发生在系统临时目录；
-- 语料正文一律来自 RAGKit 的 ``load_file`` + ``normalize_text``，本文件不实现
-  任何 Markdown 解析、front matter 剥离或空白归一；
+- RAGKit 模式的正文来自 ``load_file`` + ``normalize_text``；``plain-text`` 模式
+  的正文来自 :class:`PlainTextBackend`。两种模式都不解析 Markdown 结构；
 - 不修改 RAGKit，不联网；``verify`` 只在临时仓库里调用 git，不碰调用者工作区。
 
 为什么需要规范化快照
@@ -74,7 +84,9 @@ RAGKit 的标注区间是在 ``normalize_text(load_file(path).text)`` 上算出�
 3. 旧快照、可信加载器与 PR 原始语料全程只读；
 4. 完整 JSON 报告写到 ``--report``；退出 1 时报告一定已经落盘；
 5. 读取失败（权限、解码、路径）退出 2，绝不降级成 ``file_missing``；
-6. 两份快照完全相同时仍然创建两个提交并跑通，返回 0。
+6. 两份快照完全相同时仍然创建两个提交并跑通，返回 0；
+7. ``--loader plain-text`` 与 ``--ragkit-root`` 二选一，同时给出或都不给退出 2；
+   报告里的 ``loader`` 字段记录本次使用的规则。
 
 退出码
 ------
@@ -103,8 +115,11 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator, Sequence
 
 TOOL = "ragkit-fixture-import"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SCHEMA_VERSION = 1
+
+RAGKIT_LOADER = "ragkit"
+PLAIN_TEXT_LOADER = "plain-text"
 
 DEFAULT_QRELS = Path("data/eval/qrels.json")
 DEFAULT_MANIFEST = Path("data/eval/annotation_manifest.json")
@@ -325,7 +340,8 @@ class VerifyOptions:
     """一次 PR 证据校验的输入。
 
     Args:
-        root: 可信的 RAGKit 加载器项目根目录，只读。
+        loader: ``ragkit`` 或 ``plain-text``，二选一。
+        root: RAGKit 模式下的加载器项目根目录；``plain-text`` 模式为 ``None``。
         baseline: 旧快照目录（含冻结 fixture 与基线语料），只读。
         raw_dir: PR 版本的原始语料目录，只读。
         checker: ``rag-fixture-check`` 可执行文件路径。
@@ -334,9 +350,13 @@ class VerifyOptions:
     Notes:
         ``raw_dir`` 与 ``root`` 分开，是为了让加载器只来自可信代码，PR 只提供
         数据。verify 不接受 ``--force``：它不写快照，只写报告。
+
+        ``plain-text`` 模式不需要 ``root``：正文按固定规则从 ``raw_dir`` 读取，
+        规则见 :class:`PlainTextBackend`。
     """
 
-    root: Path
+    loader: str
+    root: Path | None
     baseline: Path
     raw_dir: Path
     checker: Path
@@ -394,6 +414,50 @@ class RagkitBackend:
         if not isinstance(normalized, str):
             raise RuntimeError("normalize_text(...) did not return a string")
         return normalized
+
+
+class PlainTextBackend:
+    """把 UTF-8 Markdown / 纯文本读成规范化正文，不需要 RAGKit。
+
+    Notes:
+        规则固定且只有三条，baseline 与 head 必须使用同一套规则：
+
+        1. 编码：按 UTF-8 严格解码，文件开头的一个 UTF-8 BOM 会被去掉；非法
+           字节直接失败（退出码 2），不会静默替换成 U+FFFD。
+        2. 换行：``\\r\\n`` 与单独的 ``\\r`` 统一为 ``\\n``；fixture 里的
+           ``exact``/``prefix``/``suffix`` 因此要按 LF 文本编写。
+        3. 其余一律不动：不合并空白、不裁剪行尾、不做 NFC/NFKC、不改大小写，
+           也不解析 Markdown 结构（标题、列表、代码块都只是普通文本）。
+
+        文件类型、符号链接与路径越界由 :func:`_read_source` 统一检查，正文
+        大小上限与 RAGKit 模式一致（``MAX_BLOB_BYTES``）。
+    """
+
+    encoding = "utf-8"
+    bom = "strip-leading"
+    line_endings = "crlf-and-cr-to-lf"
+
+    def normalized_text(self, raw_path: Path) -> str:
+        """读取并规范化一篇明文文档。
+
+        Args:
+            raw_path: 文档绝对路径。
+
+        Returns:
+            str: 去 BOM、LF 换行的正文。
+
+        Raises:
+            ValueError: 文件超过大小上限或不是合法 UTF-8。
+            OSError: 读取失败。
+        """
+        if raw_path.stat().st_size > MAX_BLOB_BYTES:
+            raise ValueError(f"file is larger than {MAX_BLOB_BYTES} bytes")
+        data = raw_path.read_bytes()
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"invalid UTF-8 at byte {exc.start}: {exc.reason}") from exc
+        return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 class DocumentReader:
@@ -2064,12 +2128,12 @@ def _temporary_repo() -> Iterator[Path]:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def run_verify(options: VerifyOptions, backend: RagkitBackend) -> VerifyResult:
+def run_verify(options: VerifyOptions, backend: RagkitBackend | PlainTextBackend) -> VerifyResult:
     """用可信加载器校验 PR 原始语料对冻结 fixture 的影响。
 
     Args:
         options: 校验选项。
-        backend: 可信 RAGKit 加载器后端。
+        backend: 文本后端：RAGKit 加载器或内置 ``plain-text``。
 
     Returns:
         VerifyResult: 完整报告、退出码与受影响题。
@@ -2105,6 +2169,13 @@ def run_verify(options: VerifyOptions, backend: RagkitBackend) -> VerifyResult:
     if bool(affected) != (checker_code == EXIT_REVIEW):
         raise InputError("checker findings do not match its exit code")
     anchors = sum(len(case["evidence"]) for case in fixture["cases"])
+    loader_info = {"mode": options.loader}
+    if options.loader == PLAIN_TEXT_LOADER:
+        loader_info.update(
+            encoding=PlainTextBackend.encoding,
+            bom=PlainTextBackend.bom,
+            lineEndings=PlainTextBackend.line_endings,
+        )
     report = {
         "schemaVersion": SCHEMA_VERSION,
         "tool": TOOL,
@@ -2112,6 +2183,7 @@ def run_verify(options: VerifyOptions, backend: RagkitBackend) -> VerifyResult:
         "mode": VERIFY_MODE,
         "status": "ok" if checker_code == EXIT_OK else "review",
         "checkerExitCode": checker_code,
+        "loader": loader_info,
         "frozenFixture": {
             "path": FIXTURE_NAME,
             "sha256": hashlib.sha256(fixture_bytes).hexdigest(),
@@ -2146,37 +2218,69 @@ def resolve_verify_options(args: argparse.Namespace) -> VerifyOptions:
         VerifyOptions: 可直接使用的选项。
 
     Raises:
-        InputError: 目录缺失、检查器不是文件、报告路径非法或落在旧快照内。
+        InputError: 加载器选项冲突或缺失、目录缺失、检查器不是文件、
+            报告路径非法或落在旧快照内。
+
+    Notes:
+        ``--ragkit-root`` 与 ``--loader plain-text`` 二选一；同时给出或都不给
+        都以退出码 2 结束，并直接说明应该怎么改。
     """
-    root = Path(args.ragkit_root).expanduser().resolve()
-    if not root.is_dir():
-        raise InputError(f"--ragkit-root is not a directory: {root}")
-    if root.name == "src" and (root / "ragkit" / "__init__.py").is_file():
-        root = root.parent
+    if args.ragkit_root and args.loader:
+        raise InputError(
+            "--ragkit-root and --loader are mutually exclusive; "
+            "keep --loader plain-text for UTF-8 Markdown/text, "
+            "or drop --loader and keep --ragkit-root for a RAGKit checkout"
+        )
+    if not args.ragkit_root and not args.loader:
+        raise InputError(
+            "one of --ragkit-root or --loader is required; "
+            "add --loader plain-text to read UTF-8 Markdown/text without RAGKit"
+        )
+    if args.loader and args.loader != PLAIN_TEXT_LOADER:
+        raise InputError(f"unsupported --loader {args.loader!r}; supported values: {PLAIN_TEXT_LOADER}")
+    loader = PLAIN_TEXT_LOADER if args.loader else RAGKIT_LOADER
+
+    root: Path | None = None
+    if loader == RAGKIT_LOADER:
+        root = Path(args.ragkit_root).expanduser().resolve()
+        if not root.is_dir():
+            raise InputError(f"--ragkit-root is not a directory: {root}")
+        if root.name == "src" and (root / "ragkit" / "__init__.py").is_file():
+            root = root.parent
 
     baseline = Path(args.baseline).expanduser().resolve()
     if not baseline.is_dir():
         raise InputError(f"--baseline is not a directory: {baseline}")
 
     raw_dir = Path(args.raw_dir).expanduser()
-    raw_dir = (root / raw_dir).resolve() if not raw_dir.is_absolute() else raw_dir.resolve()
+    if not raw_dir.is_absolute():
+        raw_dir = root / raw_dir if root is not None else raw_dir
+    raw_dir = raw_dir.resolve()
     if not raw_dir.is_dir():
         raise InputError(f"--raw-dir is not a directory: {raw_dir}")
 
-    checker = Path(args.checker).expanduser().resolve()
+    checker = Path(args.checker).expanduser()
     if not checker.is_file():
-        raise InputError(f"--checker is not a file: {checker}")
+        found = shutil.which(args.checker)
+        if found:
+            checker = Path(found)
+    checker = checker.resolve()
+    if not checker.is_file():
+        raise InputError(f"--checker is not a file: {args.checker}")
 
     report = Path(args.report).expanduser().resolve()
     if report.exists() and report.is_dir():
         raise InputError(f"--report is a directory: {report}")
     if report.is_relative_to(baseline):
         raise InputError("--report must not be written inside the baseline snapshot")
-    if report.is_relative_to(root) or report.is_relative_to(raw_dir) or report == checker:
-        raise InputError("--report must be outside the loader checkout, PR corpus and checker file")
+    if report.is_relative_to(raw_dir) or report == checker:
+        raise InputError("--report must be outside the PR corpus and the checker file")
+    if root is not None and report.is_relative_to(root):
+        raise InputError("--report must be outside the loader checkout")
     if any(part.casefold() == ".git" for part in report.parts):
         raise InputError("--report must not be written inside Git metadata")
     return VerifyOptions(
+        loader=loader,
         root=root,
         baseline=baseline,
         raw_dir=raw_dir,
@@ -2220,9 +2324,17 @@ def print_verify_report(options: VerifyOptions, result: VerifyResult) -> None:
     """
     frozen = result.report["frozenFixture"]
     corpus = result.report["corpus"]
+    loader = result.report["loader"]
     print(f"{TOOL} {VERSION} (verify)")
     print(f"baseline:     {options.baseline}")
     print(f"raw dir:      {options.raw_dir}")
+    if loader["mode"] == PLAIN_TEXT_LOADER:
+        print(
+            f"loader:       {PLAIN_TEXT_LOADER} ({loader['encoding']}, BOM {loader['bom']}, "
+            f"{loader['lineEndings']})"
+        )
+    else:
+        print(f"loader:       {RAGKIT_LOADER}")
     print(f"report:       {options.report}")
     print(f"fixture:      {FIXTURE_NAME} (frozen, sha256 {frozen['sha256'][:12]}...)")
     print(f"corpus:       {corpus['rebuilt']} rebuilt, {corpus['missing']} missing")
@@ -2242,32 +2354,40 @@ def build_verify_parser() -> argparse.ArgumentParser:
         argparse.ArgumentParser: 解析器实例。
 
     Notes:
-        五个参数都是必需的：可信加载器、旧快照、PR 原始语料、检查器、报告路径。
-        ``--raw-dir`` 没有默认值，避免误把本仓库的语料当成 PR 语料。
+        ``--ragkit-root`` 与 ``--loader plain-text`` 二选一；``--baseline``、
+        ``--raw-dir``、``--checker``、``--report`` 始终必需。``--raw-dir`` 没有
+        默认值，避免误把本仓库的语料当成 PR 语料。
     """
     parser = argparse.ArgumentParser(
         prog=f"{TOOL} verify",
         description=(
             "Check whether a docs PR invalidates committed evaluation evidence. "
             "The frozen fixture comes from --baseline, the text from --raw-dir, "
-            "and the comparison runs in a throwaway Git repository."
+            "and the comparison runs in a throwaway Git repository. "
+            "Use --loader plain-text for UTF-8 Markdown/text, or --ragkit-root for a RAGKit checkout."
         ),
     )
-    parser.add_argument("--ragkit-root", required=True, help="trusted RAGKit loader project (read-only)")
+    parser.add_argument("--ragkit-root", help="trusted RAGKit loader project (read-only); exclusive with --loader")
+    parser.add_argument(
+        "--loader",
+        help=f"built-in text loader; the only supported value is {PLAIN_TEXT_LOADER}",
+    )
     parser.add_argument("--baseline", required=True, help="snapshot holding the frozen fixture (read-only)")
-    parser.add_argument("--raw-dir", required=True, help="raw corpus of the PR (absolute or root-relative)")
-    parser.add_argument("--checker", required=True, help="rag-fixture-check executable")
+    parser.add_argument("--raw-dir", required=True, help="raw corpus of the PR (absolute, or root-relative with --ragkit-root)")
+    parser.add_argument(
+        "--checker", required=True, help="rag-fixture-check executable (command name on PATH or a path)"
+    )
     parser.add_argument("--report", required=True, help="path of the complete JSON report")
     parser.add_argument("--version", action="version", version=f"{TOOL} {VERSION}")
     return parser
 
 
-def _verify_cli(argv: Sequence[str], backend: RagkitBackend | None) -> int:
+def _verify_cli(argv: Sequence[str], backend: RagkitBackend | PlainTextBackend | None) -> int:
     """执行 ``verify`` 子命令。
 
     Args:
         argv: ``verify`` 之后的参数。
-        backend: 仅用于测试注入。
+        backend: 仅用于测试注入；``plain-text`` 模式始终使用内置后端。
 
     Returns:
         int: 0 全部有效、1 有证据需要复核、2 输入/读取/执行失败。
@@ -2279,7 +2399,9 @@ def _verify_cli(argv: Sequence[str], backend: RagkitBackend | None) -> int:
     args = build_verify_parser().parse_args(argv)
     try:
         options = resolve_verify_options(args)
-        if backend is None:
+        if options.loader == PLAIN_TEXT_LOADER:
+            backend = PlainTextBackend()
+        elif backend is None:
             backend = load_ragkit_backend(options.root)
         result = run_verify(options, backend)
     except (InputError, OSError, UnicodeError, RuntimeError) as exc:

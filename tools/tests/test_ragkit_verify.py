@@ -335,5 +335,240 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(self.load_report()["affected"][0]["id"], "faq")
 
 
+PLAIN_FIXTURE = {
+    "version": 1,
+    "cases": [
+        {
+            "id": "refund-30",
+            "question": "How many days?",
+            "evidence": [
+                {
+                    "path": "corpus/docs/refund.md",
+                    "exact": "Refunds are accepted within 30 days.",
+                    "prefix": "",
+                    "suffix": "",
+                }
+            ],
+        },
+        {
+            "id": "shipping",
+            "question": "How fast?",
+            "evidence": [
+                {
+                    "path": "corpus/docs/shipping.md",
+                    "exact": "Orders ship within 2 days.",
+                    "prefix": "",
+                    "suffix": "",
+                }
+            ],
+        },
+    ],
+}
+
+PLAIN_DOCS = {
+    "docs/refund.md": "# Refund\n\nRefunds are accepted within 30 days.\n",
+    "docs/shipping.md": "# Shipping\n\nOrders ship within 2 days.\n",
+}
+
+
+def build_plain_tree(tmp: Path, *, crlf: bool = False, bom: bool = False) -> tuple[Path, Path]:
+    """Create a plain-text corpus and its frozen baseline snapshot.
+
+    Args:
+        tmp: Temporary directory.
+        crlf: Write CRLF line endings into the raw corpus.
+        bom: Prefix each raw document with a UTF-8 BOM.
+
+    Returns:
+        tuple: ``(raw_dir, baseline_dir)``.
+    """
+    raw = tmp / "plain"
+    for doc, text in PLAIN_DOCS.items():
+        path = raw / doc
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = text.encode("utf-8")
+        if crlf:
+            data = data.replace(b"\n", b"\r\n")
+        if bom:
+            data = b"\xef\xbb\xbf" + data
+        path.write_bytes(data)
+    baseline = tmp / "snapshot"
+    write_json(baseline / imp.FIXTURE_NAME, PLAIN_FIXTURE)
+    for doc, text in PLAIN_DOCS.items():
+        write_text(baseline / "corpus" / doc, text)
+    return raw, baseline
+
+
+class PlainTextVerifyTests(unittest.TestCase):
+    """`verify --loader plain-text`：不装 RAGKit、不写加载器适配层的接入路径。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.checker = find_checker()
+        if self.checker is None:
+            self.skipTest("rag-fixture-check binary not available (set RAG_FIXTURE_CHECK_BIN or install Go)")
+        if shutil.which("git") is None:
+            self.skipTest("git is not available in PATH")
+        self.raw, self.baseline = build_plain_tree(self.tmp)
+        self.report = self.tmp / "report.json"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def verify(self, *, raw: Path | None = None, report: Path | None = None, extra: list[str] | None = None):
+        """Run ``verify --loader plain-text``."""
+        return run_cli(
+            [
+                "verify",
+                "--loader",
+                "plain-text",
+                "--baseline",
+                str(self.baseline),
+                "--raw-dir",
+                str(raw or self.raw),
+                "--checker",
+                str(self.checker),
+                "--report",
+                str(report or self.report),
+                *(extra or []),
+            ]
+        )
+
+    def load(self) -> dict:
+        return json.loads(self.report.read_text(encoding="utf-8"))
+
+    def test_unchanged_documents_pass(self) -> None:
+        code, stdout, stderr = self.verify()
+
+        self.assertEqual(code, imp.EXIT_OK, stderr)
+        self.assertIn("loader:       plain-text", stdout)
+        payload = self.load()
+        self.assertEqual(payload["loader"]["mode"], "plain-text")
+        self.assertEqual(payload["loader"]["encoding"], "utf-8")
+        self.assertEqual(payload["loader"]["bom"], "strip-leading")
+        self.assertEqual(payload["loader"]["lineEndings"], "crlf-and-cr-to-lf")
+        self.assertEqual(payload["affected"], [])
+        self.assertEqual(payload["check"]["summary"]["intact"], 2)
+        self.assertTrue(payload["frozenFixture"]["bytesIdenticalAcrossCommits"])
+
+    def test_rewrite_reports_missing(self) -> None:
+        write_text(self.raw / "docs" / "refund.md", "# Refund\n\nRefunds are accepted within 14 days.\n")
+
+        code, stdout, stderr = self.verify()
+
+        self.assertEqual(code, imp.EXIT_REVIEW, stderr)
+        self.assertIn("refund-30: missing", stdout)
+        payload = self.load()
+        self.assertEqual(payload["status"], "review")
+        self.assertEqual(payload["checkerExitCode"], 1)
+        self.assertEqual(
+            payload["affected"],
+            [{"id": "refund-30", "question": "How many days?", "statuses": ["missing"]}],
+        )
+        self.assertEqual(payload["check"]["summary"]["intact"], 1)
+        self.assertEqual(payload["check"]["summary"]["missing"], 1)
+
+    def test_deleted_file_is_file_missing(self) -> None:
+        (self.raw / "docs" / "shipping.md").unlink()
+
+        code, stdout, stderr = self.verify()
+
+        self.assertEqual(code, imp.EXIT_REVIEW, stderr)
+        self.assertIn("shipping: file_missing", stdout)
+        payload = self.load()
+        self.assertEqual(payload["corpus"]["missingPaths"], ["corpus/docs/shipping.md"])
+        self.assertEqual(payload["affected"][0]["statuses"], ["file_missing"])
+
+    def test_invalid_utf8_is_exit_two(self) -> None:
+        (self.raw / "docs" / "refund.md").write_bytes(b"\xff\xfe\x00broken\n")
+
+        code, _, stderr = self.verify()
+
+        self.assertEqual(code, imp.EXIT_USAGE)
+        self.assertIn("cannot read corpus/docs/refund.md", stderr)
+        self.assertIn("invalid UTF-8", stderr)
+        self.assertFalse(self.report.exists())
+
+    def test_crlf_and_bom_are_normalized(self) -> None:
+        self.raw, self.baseline = build_plain_tree(self.tmp, crlf=True, bom=True)
+
+        code, _, stderr = self.verify()
+
+        self.assertEqual(code, imp.EXIT_OK, stderr)
+        payload = self.load()
+        self.assertEqual(payload["check"]["summary"]["intact"], 2)
+        self.assertEqual(payload["affected"], [])
+
+    def test_both_loader_modes_are_rejected(self) -> None:
+        code, _, stderr = self.verify(extra=["--ragkit-root", str(self.tmp)])
+
+        self.assertEqual(code, imp.EXIT_USAGE)
+        self.assertIn("mutually exclusive", stderr)
+        self.assertIn("--loader plain-text", stderr)
+
+    def test_missing_loader_is_rejected(self) -> None:
+        code, _, stderr = run_cli(
+            [
+                "verify",
+                "--baseline",
+                str(self.baseline),
+                "--raw-dir",
+                str(self.raw),
+                "--checker",
+                str(self.checker),
+                "--report",
+                str(self.report),
+            ]
+        )
+
+        self.assertEqual(code, imp.EXIT_USAGE)
+        self.assertIn("one of --ragkit-root or --loader is required", stderr)
+        self.assertIn("--loader plain-text", stderr)
+
+    def test_unknown_loader_is_rejected(self) -> None:
+        code, _, stderr = run_cli(
+            [
+                "verify",
+                "--loader",
+                "ragkit",
+                "--baseline",
+                str(self.baseline),
+                "--raw-dir",
+                str(self.raw),
+                "--checker",
+                str(self.checker),
+                "--report",
+                str(self.report),
+            ]
+        )
+
+        self.assertEqual(code, imp.EXIT_USAGE)
+        self.assertIn("unsupported --loader", stderr)
+        self.assertIn("plain-text", stderr)
+
+    def test_checker_name_is_resolved_from_path(self) -> None:
+        binary_dir = str(Path(self.checker).parent)
+        with patch.dict(os.environ, {"PATH": binary_dir + os.pathsep + os.environ.get("PATH", "")}):
+            code, _, stderr = run_cli(
+                [
+                    "verify",
+                    "--loader",
+                    "plain-text",
+                    "--baseline",
+                    str(self.baseline),
+                    "--raw-dir",
+                    str(self.raw),
+                    "--checker",
+                    Path(self.checker).stem,
+                    "--report",
+                    str(self.report),
+                ]
+            )
+
+        self.assertEqual(code, imp.EXIT_OK, stderr)
+        self.assertEqual(self.load()["affected"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

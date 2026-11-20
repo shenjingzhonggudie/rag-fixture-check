@@ -1,0 +1,160 @@
+# Copy this file to .github/workflows/verify-plain-text-evidence.yml in the
+# repository whose Markdown or text files back your evaluation evidence.
+#
+# Four repository variables (Settings -> Secrets and variables -> Actions ->
+# Variables) configure it; each can also be edited directly in this file:
+#   RAG_FIXTURE_CHECK_REF   required, full 40-character SHA of a reviewed tool
+#                           commit that contains `verify --loader plain-text`
+#                           (v0.4 or newer)
+#   RAG_FIXTURE_CHECK_REPO  optional, defaults to shenjingzhonggudie/rag-fixture-check
+#   EVIDENCE_BASELINE       optional, defaults to evidence-snapshot
+#   EVIDENCE_RAW_DIR        optional, defaults to docs
+#
+# The frozen fixture and its normalized corpus are read from the base commit;
+# the PR checkout only supplies the raw Markdown. Nothing from the PR is
+# executed: the checker and the Python importer come from the pinned commit.
+name: verify-plain-text-evidence
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      RAG_FIXTURE_CHECK_REPO: ${{ vars.RAG_FIXTURE_CHECK_REPO || 'shenjingzhonggudie/rag-fixture-check' }}
+      RAG_FIXTURE_CHECK_REF: ${{ vars.RAG_FIXTURE_CHECK_REF }}
+      EVIDENCE_BASELINE: ${{ vars.EVIDENCE_BASELINE || 'evidence-snapshot' }}
+      EVIDENCE_RAW_DIR: ${{ vars.EVIDENCE_RAW_DIR || 'docs' }}
+    steps:
+      - name: Require a pinned tool revision
+        run: |
+          if [[ ! "${RAG_FIXTURE_CHECK_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Set RAG_FIXTURE_CHECK_REF to a reviewed 40-character commit SHA that contains 'verify --loader plain-text' (v0.4 or newer)."
+            exit 2
+          fi
+          if [[ ! "${RAG_FIXTURE_CHECK_REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Set RAG_FIXTURE_CHECK_REPO to 'owner/name'."
+            exit 2
+          fi
+
+      # 1. The PR side: documents only. Nothing from this checkout is executed.
+      - name: Checkout the PR documents
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          fetch-depth: 1
+          persist-credentials: false
+
+      # 2. The trusted side: the frozen fixture and the corpus it points at.
+      - name: Checkout the trusted base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          fetch-depth: 1
+          persist-credentials: false
+
+      # 3. The tool itself, from the configured repository at a reviewed commit.
+      - name: Checkout the pinned tool
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RAG_FIXTURE_CHECK_REPO }}
+          ref: ${{ env.RAG_FIXTURE_CHECK_REF }}
+          path: tool
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Build the checker from the pinned commit
+        working-directory: tool
+        run: go build -trimpath -o "$RUNNER_TEMP/rag-fixture-check" .
+
+      # The baseline is the snapshot you committed on the base branch: it holds
+      # the frozen fixture and the corpus/ copy taken at freeze time. The PR
+      # checkout must carry the documents at the same relative paths.
+      - name: Resolve the baseline and the PR documents
+        run: |
+          baseline="$GITHUB_WORKSPACE/base/${EVIDENCE_BASELINE}"
+          raw="$GITHUB_WORKSPACE/pr/${EVIDENCE_RAW_DIR}"
+          if [[ ! -f "$baseline/.rag-fixtures.json" ]]; then
+            echo "::error::No '.rag-fixtures.json' under '${EVIDENCE_BASELINE}/' on the base branch. Commit the frozen snapshot there, or point EVIDENCE_BASELINE at the folder that holds it."
+            exit 2
+          fi
+          if [[ ! -d "$raw" ]]; then
+            echo "::error::The PR checkout has no '${EVIDENCE_RAW_DIR}/' directory. Keep the Markdown under that path, or set the repository variable EVIDENCE_RAW_DIR to the folder that holds it."
+            exit 2
+          fi
+          if [[ -z "$(find "$raw" -type f \( -name '*.md' -o -name '*.markdown' -o -name '*.txt' \) -print -quit)" ]]; then
+            echo "::error::No Markdown or text files under '${EVIDENCE_RAW_DIR}/'. Check EVIDENCE_RAW_DIR, or stage the documents before running this check."
+            exit 2
+          fi
+          printf 'BASELINE_PATH=%s\n' "$baseline" >> "$GITHUB_ENV"
+          printf 'RAW_PATH=%s\n' "$raw" >> "$GITHUB_ENV"
+
+      # Exit 0 = every anchor still resolves. Exit 1 = evidence needs review
+      # (the step fails, the PR is blocked). Exit 2 = bad input, unreadable
+      # document, invalid UTF-8 or a Git/checker failure (no report is written).
+      - name: Verify evidence anchors
+        run: |
+          set +e
+          python -I -B tool/tools/ragkit_import.py verify \
+            --loader plain-text \
+            --baseline "$BASELINE_PATH" \
+            --raw-dir "$RAW_PATH" \
+            --checker "$RUNNER_TEMP/rag-fixture-check" \
+            --report "$RUNNER_TEMP/verify-report.json"
+          code=$?
+          set -e
+          if [[ $code -eq 1 ]]; then
+            echo "::error::Evidence needs review (exit 1). The affected case ids are in the log above and in the uploaded JSON report."
+          elif [[ $code -eq 2 ]]; then
+            echo "::error::verify could not run (exit 2). Fix the path, encoding or Git error reported above; no report was written."
+          fi
+          exit $code
+
+      - name: Summarize the report
+        if: always()
+        run: |
+          report="$RUNNER_TEMP/verify-report.json"
+          if [[ ! -f "$report" ]]; then
+            echo "No report was written: the run stopped before the check." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python - "$report" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          print(f"### verify: {data['status']} (exit {data['checkerExitCode']})")
+          print()
+          print(f"- fixture `{data['frozenFixture']['sha256'][:12]}…`, identical in both commits: {data['frozenFixture']['bytesIdenticalAcrossCommits']}")
+          print(f"- corpus: {data['corpus']['rebuilt']} rebuilt, {data['corpus']['missing']} missing")
+          if data["affected"]:
+              print()
+              print("| case | statuses |")
+              print("| --- | --- |")
+              for case in data["affected"]:
+                  print(f"| `{case['id']}` | {', '.join(case['statuses'])} |")
+          PY
+
+      # Keep the full JSON report even when the check fails.
+      - name: Upload the JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report
+          path: ${{ runner.temp }}/verify-report.json
+          if-no-files-found: ignore

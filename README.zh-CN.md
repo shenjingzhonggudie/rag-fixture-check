@@ -138,13 +138,13 @@ steps:
 - 两个 SHA 都取事件载荷里的固定值，分支名可能移动。
 - 只需 `contents: read`，不需要任何 secret，fork PR 也能直接跑。
 
-## 导入与刷新 RAGKit 评测集（v0.3）
+## 导入与刷新 RAGKit 评测集（v0.3 起）
 
 `tools/ragkit_import.py` 把 RAGKit 项目转成 `check` 需要的两个输入：fixture 与规范化语料快照。它直接调用 RAGKit 的 `load_file` 与 `normalize_text`，不自己实现 Markdown 解析或空白归一。
 
 **为什么要快照而不是直接用原始文档。** RAGKit 的标注区间是在 `normalize_text(load_file(path).text)` 上算的；直接拿原始 Markdown 当语料，front matter、HTML 注释、MDX 行、全角归一与行尾空白都会让偏移错位，检查器会把大量有效证据误报成 `missing`（参考实验里 589 条中有 459 条假缺失）。用规范化快照后 589 条全部 `intact`。
 
-从 [v0.3.0 源码压缩包](https://github.com/shenjingzhonggudie/rag-fixture-check/archive/refs/tags/v0.3.0.zip) 解压获得脚本。在源码目录运行，使用 Python 3.11+。导入器会执行所选 RAGKit 项目里的 Python 加载器，请使用你信任的项目。
+从 [v0.4.0 源码压缩包](https://github.com/shenjingzhonggudie/rag-fixture-check/archive/refs/tags/v0.4.0.zip) 解压获得脚本。在源码目录运行，使用 Python 3.11+。导入器会执行所选 RAGKit 项目里的 Python 加载器，请使用你信任的项目。
 
 ```powershell
 $snapshot = Join-Path $env:TEMP ("ragkit-snapshot-" + [guid]::NewGuid())
@@ -236,6 +236,54 @@ python tools/ragkit_import.py verify `
 - 退出码 `0` 表示全部有效，`1` 表示有证据需复核。两种情况都会生成报告。`2` 表示输入、读取、Git、检查器或报告写入失败，原有报告会保留。
 - 源文件读不出来（权限、解码、路径是目录）一律退出 2，绝不降级成 `file_missing`；两份快照完全相同时仍返回 0。
 - 报告包含 fixture 哈希、受影响题号和完整的 `check` 结果。`commits` 记录临时仓库的两个快照提交。
+
+评测证据指向 Markdown / 纯文本时，用 `--loader plain-text`，不需要 RAGKit 或加载器适配层。下面是最小复现，布局与 CI 模板完全一致（原文 `docs/refund.md`、基线正文 `evidence-snapshot/corpus/refund.md`、fixture 引文路径 `corpus/refund.md`、`--raw-dir docs`）：
+
+```powershell
+# 0. 同一版本：检查器与导入脚本都取 v0.4.0
+go install github.com/shenjingzhonggudie/rag-fixture-check@v0.4.0
+Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/shenjingzhonggudie/rag-fixture-check/v0.4.0/tools/ragkit_import.py" -OutFile ragkit_import.py
+
+# 1. 文档、冻结副本与手写 fixture（UTF-8、LF、无 BOM）
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+New-Item -ItemType Directory -Force docs, evidence-snapshot\corpus | Out-Null
+[IO.File]::WriteAllText("$PWD\docs\refund.md", "# Refund policy`n`nRefunds are accepted within 30 days.`n", $utf8)
+[IO.File]::WriteAllText("$PWD\evidence-snapshot\corpus\refund.md", [IO.File]::ReadAllText("$PWD\docs\refund.md"), $utf8)
+$fixture = @'
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "refund-30",
+      "question": "How many days do customers have to request a refund?",
+      "evidence": [
+        { "path": "corpus/refund.md", "exact": "Refunds are accepted within 30 days.", "prefix": "", "suffix": "" }
+      ]
+    }
+  ]
+}
+'@
+[IO.File]::WriteAllText("$PWD\evidence-snapshot\.rag-fixtures.json", $fixture, $utf8)
+
+# 2. 未改动：退出 0
+python .\ragkit_import.py verify --loader plain-text --baseline evidence-snapshot --raw-dir docs --checker rag-fixture-check --report report.json
+
+# 3. 只改原文
+[IO.File]::WriteAllText("$PWD\docs\refund.md", [IO.File]::ReadAllText("$PWD\docs\refund.md").Replace("30 days", "14 days"), $utf8)
+
+# 4. 再跑：退出 1，报告里 refund-30 为 missing
+python .\ragkit_import.py verify --loader plain-text --baseline evidence-snapshot --raw-dir docs --checker rag-fixture-check --report report.json
+```
+
+规则固定：UTF-8 严格解码、去掉开头一个 BOM、`\r\n` 与 `\r` 归一成 `\n`，其余（空白、行尾、Unicode 归一、Markdown 结构）一律不动；baseline 与 head 必须使用同一规则，报告里的 `loader` 字段会记录本次规则。`.rag-fixtures.json` 本身要用**无 BOM** 的 UTF-8：两边都按 JSON 解析，BOM 会直接报错（PowerShell 5.1 的 `Set-Content -Encoding utf8` 会加 BOM，所以上面用 `[IO.File]::WriteAllText`）。`--ragkit-root` 与 `--loader` 二选一，同时给出或都不给都以退出码 2 结束并提示怎么改。
+
+给 PR 加检查：复制 [`examples/workflows/verify-plain-text-evidence.yml`](examples/workflows/verify-plain-text-evidence.yml) 到 `.github/workflows/`，默认布局就是上面的 `docs/` 与 `evidence-snapshot/`。仓库变量 `RAG_FIXTURE_CHECK_REF` 填 v0.4.0 标签指向的**完整提交 SHA**：
+
+```bash
+git ls-remote https://github.com/shenjingzhonggudie/rag-fixture-check 'refs/tags/v0.4.0^{}'
+```
+
+需要时用 `EVIDENCE_BASELINE` / `EVIDENCE_RAW_DIR` 改目录名。退出 0 通过；退出 1 失败并上传完整 JSON 报告；退出 2 在日志里直接报出缺失目录、编码或 Git 错误。填 v0.3.0 的提交会以 `unrecognized arguments: --loader` 退出 2。
 
 使用 [GitHub Actions 示例](examples/workflows/verify-ragkit-evidence.yml) 时，把基线快照提交到 base 分支的 `rag-snapshot/`，可信加载器放在 `src/ragkit/`，原始文档放在 `data/raw/`。通过仓库变量（Settings → Secrets and variables → Actions → Variables）或直接编辑模板的 `env:` 设置两项：
 

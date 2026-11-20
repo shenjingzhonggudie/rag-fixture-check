@@ -2,7 +2,7 @@
 
 **Know which RAG evaluation cases your docs PR just broke — before it merges.**
 
-[中文文档](README.zh-CN.md) · [Download v0.3.0](https://github.com/shenjingzhonggudie/rag-fixture-check/releases/tag/v0.3.0) · [CI workflow](examples/workflows/rag-fixture-check.yml)
+[中文文档](README.zh-CN.md) · [Download v0.4.0](https://github.com/shenjingzhonggudie/rag-fixture-check/releases/tag/v0.4.0) · [CI workflow](examples/workflows/rag-fixture-check.yml)
 
 `rag-fixture-check` is a single-binary Go CLI that resolves every evidence anchor in your RAG fixture against the committed tree of a pull request. It tells you exactly which quotes disappeared, which ones moved, which ones became ambiguous, and which `prefix`/`suffix` selectors no longer match.
 
@@ -17,6 +17,8 @@ It is deliberately narrow: **it verifies evidence anchoring, not answer quality.
 
 ## Table of contents
 
+- [60-second example: plain Markdown, no RAGKit](#60-second-example-plain-markdown-no-ragkit)
+- [Add the check to a pull request](#add-the-check-to-a-pull-request)
 - [The problem](#the-problem)
 - [2-minute quickstart](#2-minute-quickstart)
 - [Install](#install)
@@ -33,6 +35,169 @@ It is deliberately narrow: **it verifies evidence anchoring, not answer quality.
 - [Security model](#security-model)
 - [Development](#development)
 - [License](#license)
+
+---
+
+## 60-second example: plain Markdown, no RAGKit
+
+If your evaluation set points at Markdown or plain text, you need neither RAGKit nor a loader adapter. This is the same layout the [GitHub Actions template](#add-the-check-to-a-pull-request) expects, so the local demo and the CI check stay in sync.
+
+```bash
+# 0. Same version for both halves: the checker and the importer script.
+go install github.com/shenjingzhonggudie/rag-fixture-check@v0.4.0
+curl -fsSL -o ragkit_import.py \
+  https://raw.githubusercontent.com/shenjingzhonggudie/rag-fixture-check/v0.4.0/tools/ragkit_import.py
+
+# 1. Documents, their frozen baseline copy, and a hand-written fixture.
+mkdir -p docs evidence-snapshot/corpus
+printf '# Refund policy\n\nRefunds are accepted within 30 days.\n' > docs/refund.md
+cp docs/refund.md evidence-snapshot/corpus/refund.md
+cat > evidence-snapshot/.rag-fixtures.json <<'EOF'
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "refund-30",
+      "question": "How many days do customers have to request a refund?",
+      "evidence": [
+        {
+          "path": "corpus/refund.md",
+          "exact": "Refunds are accepted within 30 days.",
+          "prefix": "",
+          "suffix": ""
+        }
+      ]
+    }
+  ]
+}
+EOF
+
+# 2. Nothing changed yet: exit 0.
+python ragkit_import.py verify --loader plain-text \
+  --baseline evidence-snapshot --raw-dir docs \
+  --checker rag-fixture-check --report report.json
+
+# 3. Edit the original Markdown. Nothing else changes.
+python - <<'PY'
+from pathlib import Path
+path = Path("docs/refund.md")
+path.write_text(path.read_text(encoding="utf-8").replace("30 days", "14 days"),
+                encoding="utf-8", newline="\n")
+PY
+
+# 4. Same command: exit 1 with the affected case id.
+python ragkit_import.py verify --loader plain-text \
+  --baseline evidence-snapshot --raw-dir docs \
+  --checker rag-fixture-check --report report.json
+```
+
+Step 2 prints:
+
+```text
+ragkit-fixture-import 0.4.0 (verify)
+loader:       plain-text (utf-8, BOM strip-leading, crlf-and-cr-to-lf)
+corpus:       1 rebuilt, 0 missing
+status: ok (exit 0)
+```
+
+Step 4 prints:
+
+```text
+ragkit-fixture-import 0.4.0 (verify)
+loader:       plain-text (utf-8, BOM strip-leading, crlf-and-cr-to-lf)
+corpus:       1 rebuilt, 0 missing
+affected:
+  refund-30: missing
+status: review needed (exit 1)
+```
+
+`report.json` holds the full checker output; the short version is:
+
+```json
+{
+  "status": "review",
+  "loader": { "mode": "plain-text", "encoding": "utf-8", "bom": "strip-leading", "lineEndings": "crlf-and-cr-to-lf" },
+  "affected": [
+    { "id": "refund-30", "question": "How many days...", "statuses": ["missing"] }
+  ],
+  "check": { "summary": { "cases": 1, "evidence": 1, "intact": 0, "missing": 1, "needsReview": true } }
+}
+```
+
+`--checker` accepts a command name on `PATH` or an explicit path. `evidence-snapshot/corpus/refund.md` is the frozen copy, so it must already be in the plain-text form described below (LF line endings, no BOM). `evidence-snapshot/.rag-fixtures.json` is byte-identical in both throwaway commits; the report says so under `frozenFixture.bytesIdenticalAcrossCommits`. Write the fixture as UTF-8 without a BOM too: both the importer and the checker parse it as JSON, and a BOM is a parse error (Windows PowerShell 5.1's `Set-Content -Encoding utf8` adds one).
+
+Both artifacts in step 0 come from the same tag. `go install` puts `rag-fixture-check` in `$(go env GOPATH)/bin`; the `curl` line downloads `tools/ragkit_import.py` from that tag, so the checker and the importer never drift apart. The same files are in the release archives and the source tree.
+
+**`--loader plain-text` rules** (baseline and head always use the same ones, and the report records them under `loader`):
+
+| Rule | Behaviour |
+| --- | --- |
+| Encoding | UTF-8, decoded strictly; one leading UTF-8 BOM is removed; invalid bytes exit 2 instead of becoming U+FFFD |
+| Line endings | `\r\n` and a lone `\r` become `\n`, so quotes, prefixes and suffixes are written against LF text |
+| Everything else | untouched: no whitespace collapsing, no trailing-space trimming, no NFC/NFKC, no Markdown parsing (headings, lists and code fences are plain text) |
+| Size | same 8 MiB normalized-text limit as the RAGKit loader |
+
+`--ragkit-root` and `--loader plain-text` are mutually exclusive. Passing both, or neither, exits 2 with a message naming the option to keep. The RAGKit flow below is unchanged.
+
+---
+
+## Add the check to a pull request
+
+Once the demo above works, copy [`examples/workflows/verify-plain-text-evidence.yml`](examples/workflows/verify-plain-text-evidence.yml) to `.github/workflows/` and commit the layout it expects on your default branch:
+
+```text
+docs/                                    raw Markdown; the only folder a docs PR edits
+evidence-snapshot/                       frozen baseline: .rag-fixtures.json + corpus/
+.github/workflows/verify-plain-text-evidence.yml
+```
+
+Fixture paths are relative to `EVIDENCE_RAW_DIR`: with the default `docs`, a file at `docs/refund.md` is `corpus/refund.md` in `.rag-fixtures.json`, and the frozen copy sits at `evidence-snapshot/corpus/refund.md` — exactly what the demo above creates. If you keep the `docs/` prefix in your fixture instead, set `EVIDENCE_RAW_DIR` to `.`; `--raw-dir` is only the root that fixture paths resolve against.
+
+| Repository variable | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `RAG_FIXTURE_CHECK_REF` | yes | — | full 40-character SHA of a tool commit containing `verify --loader plain-text` (see below) |
+| `RAG_FIXTURE_CHECK_REPO` | no | `shenjingzhonggudie/rag-fixture-check` | tool repository, for forks and mirrors |
+| `EVIDENCE_BASELINE` | no | `evidence-snapshot` | folder that holds the frozen fixture and its `corpus/` |
+| `EVIDENCE_RAW_DIR` | no | `docs` | folder that holds the Markdown, relative to the PR checkout |
+
+The job checks out the PR head into `pr/`, the base commit into `base/`, and the pinned tool into `tool/`. The fixture and its `corpus/` come from `base/`; the Markdown comes from `pr/`. Nothing from the PR is executed.
+
+| Outcome | What the job does |
+| --- | --- |
+| exit 0 | passes; the report is uploaded |
+| exit 1 | fails, prints the affected case ids, uploads `verify-report` with the complete JSON, and writes a summary table to the job page |
+| exit 2 | fails before any report is written, with an `::error::` line naming the broken input (missing `docs/`, missing baseline, invalid UTF-8, unreadable file, Git or checker failure) |
+
+Two cases that come up in review:
+
+- **No `docs/` in the PR checkout.** The job stops with `The PR checkout has no 'docs/' directory` and tells you to keep the documents there or set `EVIDENCE_RAW_DIR`. It never falls back to the base copy, so a PR cannot pass by shipping nothing.
+- **A PR deletes one evidence document.** The corpus is rebuilt without it and every anchor that pointed at it becomes `file_missing` (exit 1). Deleting the entire document folder is an input error (exit 2), not a pass.
+
+Expected output when one page is rewritten:
+
+```text
+ragkit-fixture-import 0.4.0 (verify)
+loader:       plain-text (utf-8, BOM strip-leading, crlf-and-cr-to-lf)
+corpus:       2 rebuilt, 0 missing
+affected:
+  refund-30: missing
+status: review needed (exit 1)
+```
+
+The uploaded report adds the fixture SHA-256, `bytesIdenticalAcrossCommits`, the rebuilt/missing document counts and the complete checker output.
+
+### Which commit goes into RAG_FIXTURE_CHECK_REF
+
+The variable wants a commit that contains `verify --loader plain-text` — that is v0.4.0 or newer. Ask the remote for the commit the tag points to:
+
+```bash
+git ls-remote https://github.com/shenjingzhonggudie/rag-fixture-check refs/tags/v0.4.0
+# 40 hex characters  refs/tags/v0.4.0
+git ls-remote https://github.com/shenjingzhonggudie/rag-fixture-check 'refs/tags/v0.4.0^{}'
+# the same 40 hex characters, this time for the commit itself
+```
+
+Paste the second line's SHA into the variable. Tags can move and short SHAs can become ambiguous, which is why the workflow only accepts the full 40-character commit id. Pinning v0.3.0 there makes the job exit 2 with `unrecognized arguments: --loader`; the RAGKit template keeps working with v0.3.0 either way.
 
 ---
 
@@ -71,7 +236,7 @@ The demo builds a temporary repository with two commits, breaks a refund window,
 To try real annotated evidence, run the [QASPER smoke test](examples/qasper/README.md). It retrieves six human-annotated evidence paragraphs and compares them across two Git commits with controlled edits.
 
 ```text
-rag-fixture-check 0.3.0
+rag-fixture-check 0.4.0
 repo:     /tmp/rag-fixture-demo-1234567
 base:     4a1c0f0...
 head:     9b7e2d1...
@@ -145,7 +310,9 @@ go build -trimpath -o rag-fixture-check .
 
 Requirements at runtime: a `git` executable in `PATH`. Nothing else — no Python, no embeddings, no network access.
 
-Pin a version in CI with `go install ...@v0.3.0` or a checksummed release asset.
+Pin a version in CI with `go install ...@v0.4.0` or a checksummed release asset.
+
+The Python importer is not part of the Go binary: take `tools/ragkit_import.py` from the same tag, the source archive, or with the `curl` line in the quickstart above. Checker and importer are released together, so their versions always match.
 
 ## CLI
 
@@ -262,7 +429,7 @@ Stable, versioned (`schemaVersion: 1`), deterministic: the same input produces b
 {
   "schemaVersion": 1,
   "tool": "rag-fixture-check",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "repo": "/repo",
   "base": "4a1c0f0...",
   "head": "9b7e2d1...",
@@ -408,7 +575,7 @@ RAGKit records quotes and offsets against `normalize_text(load_file(path).text)`
 
 - Python 3.11+ for the importer only; the Go CLI stays dependency-free
 - A RAGKit checkout containing `data/eval/qrels.json`, `data/raw/` and, optionally, `data/eval/annotation_manifest.json`
-- The importer script from the [v0.3.0 source tree](https://github.com/shenjingzhonggudie/rag-fixture-check/tree/v0.3.0). It is also available in the [source archive](https://github.com/shenjingzhonggudie/rag-fixture-check/archive/refs/tags/v0.3.0.zip) if you installed only the checker binary.
+- The importer script from the [v0.4.0 source tree](https://github.com/shenjingzhonggudie/rag-fixture-check/tree/v0.4.0). It is also available in the [source archive](https://github.com/shenjingzhonggudie/rag-fixture-check/archive/refs/tags/v0.4.0.zip) if you installed only the checker binary.
 
 ### Import
 
@@ -496,6 +663,19 @@ python tools/ragkit_import.py verify \
   --checker /usr/local/bin/rag-fixture-check \
   --report verify-report.json
 ```
+
+For Markdown or plain-text corpora, swap `--ragkit-root` for the built-in loader — no RAGKit checkout, no adapter:
+
+```bash
+python tools/ragkit_import.py verify \
+  --loader plain-text \
+  --baseline /tmp/snapshot \
+  --raw-dir /path/to/pr/docs \
+  --checker /usr/local/bin/rag-fixture-check \
+  --report verify-report.json
+```
+
+The two options are mutually exclusive; passing both, or neither, exits 2 with a message naming the one to keep. The rules are the ones listed in the [60-second example](#60-second-example-plain-markdown-no-ragkit): strict UTF-8 with one leading BOM removed, CRLF and CR folded to LF, nothing else touched. The baseline and head always use the same rule, and the report records it under `loader`.
 
 | Exit | Meaning |
 | --- | --- |

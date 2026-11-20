@@ -20,7 +20,7 @@ import (
 const ToolName = "rag-fixture-check"
 
 // Version 是发布版本号；与 tools/ragkit_import.py 保持同一条版本线。
-const Version = "0.3.0"
+const Version = "0.4.0"
 
 // 退出码契约。
 const (
